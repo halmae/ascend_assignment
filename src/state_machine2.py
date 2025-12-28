@@ -261,8 +261,245 @@ class StateMachine:
     def process_event(self, event: Dict) -> str:
         """
         개별 이벤트 처리
-        Returns: 'ACCEPT' | 'REPAIR' | 'QUARANTINE'
+
+        Args:
+            event: {
+                'stream' : 'orderbook' | 'trades' | 'liquidations' | 'ticker',
+                'timestamp': int,
+                'local_timestamp': int,
+                'data': {...} # 실제 이벤트 데이터
+            }
+
+        Returns:
+            'ACCEPT' | 'REPAIR' | 'QUARANTINE'
         """
+
+        self.stats['total_events'] += 1
+
+        # === Snapshot vs Incremental 구분 ===
+        if event['stream'] == 'orderbook' and event['data'].get('is_snapshot', False):
+            return self._process_shapshot_event(event)
+        
+        # === 데이터 품질 검사 ===
+        sanitization_result = self._sanitize_event(event)
+
+        if sanitization_result == 'QUARANTINE':
+            return self._quarantine_event(event)
+        
+        if sanitization_result == 'REPAIR':
+            event = self._repair_event(event)
+
+        # === 스트림별 처리 ===
+        if event['stream'] == 'orderbook':
+            self._update_orderbook(event)
+        elif event['stream'] == 'trades':
+            self._process_trade(event)
+        elif event['stream'] == 'liquidations':
+            self._process_liquidation(event)
+        elif event['stream'] == 'ticker':
+            self._process_ticker(event)
+
+        # === Update Statistics ===
+        if sanitization_result == 'ACCEPT':
+            self.stats['accepted'] += 1
+        elif sanitization_result == 'REPAIR':
+            self.stats['repaired'] += 1
+
+        # === State transition check ===
+        self._check_state_transition()
+
+        return sanitization_result
+
+
+    def _sanitize_event(self, event: Dict) -> str:
+        """
+        이벤트 데이터 품질 검사
+
+        Returns:
+            'ACCEPT' | 'REPAIR' | 'QUARANTINE'
+        """
+        data = event['data']
+        timestamp = event['timestamp']
+
+        # === Check Out-of-order timestamp ===
+        if self.current_watermark and timestamp < self.current_watermark - self.lateness:
+            self.stats['late_arrivals'] += 1
+            return 'QUARANTINE'
+        
+        # === Check Future timestamp ===
+        if self.window_end and timestamp > self.window_end + self.window:
+            return 'QUARANTINE'
+        
+        # === Check Orderbook specific checks ===
+        if event['stream'] == 'orderbook':
+            return self._sanitize_orderbook_event(event)
+        
+        # === Check Trades specific checks ===
+        if event['stream'] == 'trades':
+            return self._sanitize_trade_event(event)
+        
+        # === Liquidation specific checks ===
+        if event['stream'] == 'liquidations':
+            return self._sanitize_liquidation_event(event)
+        
+        return 'ACCEPT'
+
+
+    def _sanitize_orderbook_event(self, event: Dict) -> str:
+        """
+        Orderbook 이벤트 검증
+        """
+        data = event['data']
+
+        # 필수 필드 확인
+        required_fields = ['price', 'amount', 'side']
+        if not all(field in data for field in required_fields):
+            return 'QUARANTINE'
+        
+        price = data['price']
+        amount = data['amount']
+        side = data['side']
+
+        # === Invalid price / amount ===
+        if price <= 0 or amount < 0:
+            return 'QUARANTINE'
+        
+        # === Fat-finger price check ===
+        if self.current_snapshot:
+            mid_price = self.get_mid_price()
+
+            if mid_price:
+                price_deviation = abs(price - mid_price) / mid_price
+
+                # TODO How to define this threshold?
+                if price_deviation > 0.10:
+                    print(f"Fat-finger detected: price={price}, mid={mid_price}, deviation={price_deviation*100:.2f}%")
+                    return 'QUARANTINE'
+                
+                # TODO 경고하지만 수정 가능? <- 판단을 허용할만큼 안정한 정도?
+                if price_deviation > 0.05:
+                    return 'REPAIR'
+                
+        # === Crossed market check ===
+        # TODO 나중에 _update_orderbook에서 체크
+        
+        return 'ACCEPT'
+
+
+    def _sanitize_trade_event(self, event: Dict) -> str:
+        """
+        Trade 이벤트 검증
+        """
+        data = event['data']
+
+        if 'price' not in data or 'amount' not in data:
+            return 'QUARANTINE'
+        
+        if data['price'] <= 0 or data['amount'] <= 0:
+            return 'QUARANTINE'
+        
+        # Fat-finger check
+        if self.current_snapshot:
+            mid_price = self.get_mid_price()
+            if mid_price:
+                deviation = abs(data['price'] - mid_price) / mid_price
+                if deviation > 0.10:
+                    return 'QUARANTINE'
+                
+        return 'ACCEPT'
+
+
+    def _sanitize_liquidation_event(self, event: Dict) -> str:
+        """
+        Liquidation 이벤트 검증
+
+        청산 이벤트는 시장 위기 신호 -> 특별 처리
+        """
+        data = event['data']
+
+        if 'price' not in data or 'amount' not in data:
+            return 'QUARANTINE'
+        
+        print(f"Liquidation detected: {data}")
+        self.hypothesis = HypothesisState.WEAKENING
+
+        return 'ACCEPT'
+
+
+    def _repair_event(self, event: Dict) -> Dict:
+        """
+        수정 가능한 데이터 복구
+        """
+        # TODO
+        return 'QUARANTINE'
+
+
+    def _update_orderbook(self, event: Dict):
+        """
+        Orderbook 증분 업데이트
+        """
+
+        if not self.current_snapshot:
+            print("No snapshot available for update")
+            return
+        
+        data = event['data']
+        price = data['price']
+        amount = data['amount']
+        side = data['side']
+
+        # === 업데이트 적용 ===
+        if side == 'bid':
+            levels = self.current_snapshot['bids']
+        else:
+            levels = self.current_snapshot['asks']
+
+        # 기존 price level 찾기
+        updated = False
+        for i, (p, a) in enumerate(levels):
+            if abs(p - price) < 0.01:
+                if amount == 0:
+                    levels.pop(i)
+                else:
+                    levels[i] = (price, amount)
+                updated = True
+                break
+
+        if not updated and amount > 0:
+            levels.append((price, amount))
+
+            levels.sort(key=lambda x: x[0], reverse=(side == 'bid'))
+
+        if self.current_snapshot['bids'] and self.current_snapshot['asks']:
+            best_bid = self.current_snapshot['bids'][0][0]
+            best_ask = self.current_snapshot['asks'][0][0]
+
+            if best_bid >= best_ask:
+                print(f"Crossed market after update! Bid: {best_bid}, Ask: {best_ask}")
+                self.data_trust = DataTrustState.DEGRADED
+
+    
+    def _process_trade(self, event: Dict):
+        """
+        Trade 이벤트 처리 (현재는 로깅만)
+        """
+        # 거래 발생 확인용
+        pass
+
+
+    def _process_liquidation(self, event: Dict):
+        """
+        Liquidation 이벤트 처리
+        """
+        # 이미 _sanitize_liquidation_event에서 처리
+        pass
+
+
+    def _process_ticker(self, event: Dict):
+        """
+        Ticker 이벤트 처리
+        """
+        # 시장 가격 정보 업데이트
         pass
 
 
