@@ -278,7 +278,7 @@ class StateMachine:
 
         # === Snapshot vs Incremental 구분 ===
         if event['stream'] == 'orderbook' and event['data'].get('is_snapshot', False):
-            return self._process_shapshot_event(event)
+            return self._process_snapshot_event(event)  # 수정: shapshot → snapshot
         
         # === 데이터 품질 검사 ===
         sanitization_result = self._sanitize_event(event)
@@ -294,7 +294,7 @@ class StateMachine:
             self._update_orderbook(event)
         elif event['stream'] == 'trades':
             self._process_trade(event)
-        elif event['stream'] == 'liquidations':
+        elif event['stream'] == 'liquidations':  # 수정: streeam → stream
             self._process_liquidation(event)
         elif event['stream'] == 'ticker':
             self._process_ticker(event)
@@ -302,7 +302,7 @@ class StateMachine:
         # === Update Statistics ===
         if sanitization_result == 'ACCEPT':
             self.stats['accepted'] += 1
-        elif sanitization_result == 'REPAIR':
+        elif sanitization_result == 'REPAIR':  # 수정: REAPIR → REPAIR
             self.stats['repaired'] += 1
 
         # === State transition check ===
@@ -430,8 +430,9 @@ class StateMachine:
         """
         수정 가능한 데이터 복구
         """
-        # TODO
-        return 'QUARANTINE'
+        # TODO: 실제 복구 로직 구현 필요
+        # 수정: 문자열 'QUARANTINE' 대신 원본 event Dict 반환
+        return event
 
 
     def _update_orderbook(self, event: Dict):
@@ -522,3 +523,36 @@ class StateMachine:
         상태 전이 및 로깅
         """
         pass
+
+
+    # === Utility ===
+    def get_best_bid(self) -> Optional[float]:
+        """현재 최고 매수 가격"""
+        if self.current_snapshot and self.current_snapshot['bids']:
+            return self.current_snapshot['bids'][0][0]
+        return None
+
+
+    def get_best_ask(self) -> Optional[float]:
+        """현재 최저 매도 가격"""
+        if self.current_snapshot and self.current_snapshot['asks']:
+            return self.current_snapshot['asks'][0][0]
+        return None
+
+
+    def get_spread(self) -> Optional[float]:
+        """현재 스프레드"""
+        bid = self.get_best_bid()
+        ask = self.get_best_ask()
+        if bid and ask:
+            return ask - bid
+        return None
+
+
+    def get_mid_price(self) -> Optional[float]:
+        """중간 가격"""
+        bid = self.get_best_bid()
+        ask = self.get_best_ask()
+        if bid and ask:
+            return (bid + ask) / 2
+        return None
