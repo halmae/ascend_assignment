@@ -5,7 +5,7 @@ from collections import deque
 from typing import List, Optional, Dict, Deque
 from src.enums import EventType, DataTrustState, RepairAction
 from src.data_types import Event, OrderbookState
-from src.consistency import ConsistencyChecker
+from src.consistency import ConsistencyChecker, CheckResult, ConsistencyReport
 from src.orderbook import OrderbookMetrics
 from src.config import DEFAULT_PROCESSOR_CONFIG, DEFAULT_CONSISTENCY_CONFIG
 
@@ -61,7 +61,7 @@ class StreamProcessor:
         }
 
         # Consistency Checker
-        self.consistency_checker = ConsistencyChecker(consistency_config)
+        self.consistency_checker = ConsistencyChecker()
 
         # last watermark
         self.last_watermark = None
@@ -265,92 +265,57 @@ class StreamProcessor:
 
     def _validate_trade(self, event: Event) -> RepairAction:
         """
-        Trade 검증
-
-        Returns:
-            RepairAction (ACCEPT, REPAIR, QUARANTINE)
+        심플한 검증: Trade price가 현재 orderbook 범위 내에 있는가?
         """
-        if not self.prev_orderbook or not self.current_orderbook:
+        if not self.current_orderbook:
             return RepairAction.QUARANTINE
         
-        data = event.data
-        price = float(data['price'])
-        amount = float(data['amount'])
-        side = data['side']
-
-        target_side = 'ask' if side == 'buy' else 'bid'
-
-        prev_levels = (self.prev_orderbook.ask_levels if target_side == 'ask'
-                       else self.prev_orderbook.bid_levels)
-        curr_levels = (self.current_orderbook.ask_levels if target_side == 'ask'
-                       else self.current_orderbook.bid_levels)
+        price = float(event.data['price'])
+        side = event.data['side']
         
-        if price not in prev_levels:
+        best_bid = self.current_orderbook.get_best_bid()
+        best_ask = self.current_orderbook.get_best_ask()
+        
+        if best_bid is None or best_ask is None:
             return RepairAction.QUARANTINE
         
-        # Amount 변화 확인
-        prev_amount = prev_levels[price]
-        curr_amount = curr_levels.get(price, 0)
-
-        delta_amount = prev_amount - curr_amount
-
-        tolerance = self.consistency_config.trade_amount_tolerance
-
-        if abs(delta_amount - amount) / amount <= tolerance:
-            return RepairAction.ACCEPT
-        elif delta_amount > 0:
-            return RepairAction.REPAIR
+        # Buy trade는 best_ask 근처에서 발생해야 함
+        # Sell trade는 best_bid 근처에서 발생해야 함
+        if side == 'buy':
+            # Trade price가 best_ask보다 너무 높으면 이상함
+            if price > best_ask * 1.001:  # 0.1% 허용
+                return RepairAction.QUARANTINE
         else:
-            return RepairAction.QUARANTINE
+            # Trade price가 best_bid보다 너무 낮으면 이상함
+            if price < best_bid * 0.999:
+                return RepairAction.QUARANTINE
+        
+        return RepairAction.ACCEPT
         
 
     def _process_ticker(self, event: Event):
-        """Ticker 이벤트 처리 및 Consistency Check"""
+        """Ticker 이벤트 처리 - 단순화된 버전"""
         self.stats['ticker_checkpoints'] += 1
         
-        # 변수 초기화
-        consistency_score = 0.0
-        result = None
-        
         # Consistency check
-        if not self.current_orderbook:
-            # Orderbook이 아직 없으면
-            consistency_score = 0.0
-            self.data_trust_state = DataTrustState.UNTRUSTED
-        else:
-            # Orderbook이 있으면 consistency check
-            result = self.consistency_checker.check_overall_consistency(
-                ticker_data=event.data,
-                orderbook=self.current_orderbook,
-                total_events=self.stats['events_processed'],
-                repairs=self.stats['repairs'],
-                quarantines=self.stats['quarantines']
-            )
-            
-            consistency_score = result['overall_score']
-            
-            # State 전환
-            if consistency_score >= self.processor_config.trusted_threshold:
-                self.data_trust_state = DataTrustState.TRUSTED
-            elif consistency_score >= self.processor_config.degraded_threshold:
-                self.data_trust_state = DataTrustState.DEGRADED
-            else:
-                self.data_trust_state = DataTrustState.UNTRUSTED
+        report = self.consistency_checker.check_all(
+            ticker_data=event.data,
+            orderbook=self.current_orderbook
+        )
         
-        # 로그 출력 (일정 간격마다)
-        if self.stats['ticker_checkpoints'] % self.processor_config.consistency_log_interval == 0:
-            if result is not None:
-                # 정상적인 consistency check 결과가 있을 때
-                self._print_consistency_check(event, result)
-            else:
-                # Orderbook이 없을 때 간단한 로그
-                print(f"\n{'='*60}")
-                print(f"🔔 Ticker Checkpoint #{self.stats['ticker_checkpoints']} at {event.timestamp}")
-                print(f"{'='*60}")
-                print(f"  Data Trust State: {self.data_trust_state.value}")
-                print(f"  Consistency Score: {consistency_score:.2%}")
-                print(f"  Events Processed: {self.stats['events_processed']}")
-                print(f"  ⚠️ Orderbook not initialized yet")
+        # State 전환 - 단순한 규칙
+        if report.all_passed:
+            self.data_trust_state = DataTrustState.TRUSTED
+        elif report.fail_count <= 1:
+            self.data_trust_state = DataTrustState.DEGRADED
+        else:
+            self.data_trust_state = DataTrustState.UNTRUSTED
+        
+        # 간단한 로그
+        if self.stats['ticker_checkpoints'] % 100 == 0:
+            failed = [k for k, v in report.checks.items() if v == CheckResult.FAIL]
+            print(f"Ticker #{self.stats['ticker_checkpoints']}: "
+                f"{self.data_trust_state.value}, failed={failed}")
 
         
     def _process_liquidation(self, event: Event):

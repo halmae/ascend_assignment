@@ -1,309 +1,186 @@
-"""
-Consistency Check Logic
-"""
-from typing import Dict, Optional
-from src.data_types import OrderbookState
-from src.orderbook import OrderbookMetrics
-from src.config import DEFAULT_CONSISTENCY_CONFIG
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, Optional, List
+
+
+class CheckResult(Enum):
+    """단순한 체크 결과"""
+    PASS = "pass"
+    FAIL = "fail"
+    SKIP = "skip"  # 데이터 부족으로 체크 불가
+
+
+@dataclass
+class ConsistencyReport:
+    """Consistency 체크 결과 리포트"""
+    checks: Dict[str, CheckResult]
+    
+    @property
+    def all_passed(self) -> bool:
+        """모든 체크가 통과했는가?"""
+        return all(r == CheckResult.PASS for r in self.checks.values() 
+                   if r != CheckResult.SKIP)
+    
+    @property
+    def any_failed(self) -> bool:
+        """하나라도 실패했는가?"""
+        return any(r == CheckResult.FAIL for r in self.checks.values())
+    
+    @property
+    def fail_count(self) -> int:
+        """실패한 체크 수"""
+        return sum(1 for r in self.checks.values() if r == CheckResult.FAIL)
 
 
 class ConsistencyChecker:
-    """Ticker 데이터와 Orderbook 상태의 일관성 검증"""
-
-    def __init__(self, config=None):
-        """
-        Args:
-            config: ConsistencyConfig Instance
-        """
-        self.config = config or DEFAULT_CONSISTENCY_CONFIG
-
-    def check_price_consistency(self, ticker_data: Dict, orderbook: OrderbookState) -> Dict:
-        """
-        가격 일관성 체크
-
-        Args:
-            ticker_data: Ticker 이벤트 데이터
-            orderbook: 현재 Orderbook 상태
-
-        Returns:
-            {
-                'score': float, # 0~1
-                'details': {
-                    'last_vs_mid': float,
-                    'mark_vs_mid': float,
-                    'index_vs_mid': float,
-                    'mark_vs_index': float
-                }
-            }
-        """
-        spread_info = OrderbookMetrics.calculate_spread(orderbook)
-
-        if spread_info is None:
-            return {'score': 0.0, 'details': {}}
-        
-        mid_price = spread_info['mid_price']
-        last_price = ticker_data.get('last_price', mid_price)
-        mark_price = ticker_data.get('mark_price', mid_price)
-        index_price = ticker_data.get('index_price', mid_price)
-
-        def price_diff_pct(p1, p2):
-            return abs(p1-p2)/p2 * 100 if p2 > 0 else 0
-        
-        last_vs_mid = price_diff_pct(last_price, mid_price)
-        mark_vs_mid = price_diff_pct(mark_price, mid_price)
-        index_vs_mid = price_diff_pct(index_price, mid_price)
-        mark_vs_index = price_diff_pct(mark_price, index_price)
-
-        def calc_score(diff, tolerance):
-            if diff <= tolerance:
-                return 1.0
-            else:
-                return max(0, 1.0 - (diff-tolerance) / tolerance)
-            
-        score_last_vs_mid = calc_score(
-            last_vs_mid,
-            self.config.price_tolerance_last_vs_mid
-        )
-        score_mark_vs_mid = calc_score(
-            mark_vs_mid,
-            self.config.price_tolerance_mark_vs_mid
-        )
-        score_index_vs_mid = calc_score(
-            index_vs_mid,
-            self.config.price_tolerance_index_vs_mid
-        )
-        score_mark_vs_index = calc_score(
-            mark_vs_index,
-            self.config.price_tolerance_mark_vs_index
-        )
-
-        # total score
-        overall_score = (
-            score_last_vs_mid +
-            score_mark_vs_mid + 
-            score_index_vs_mid +
-            score_mark_vs_index
-        ) / 4
-
-        return {
-            'score': overall_score,
-            'details': {
-                'last_vs_mid': score_last_vs_mid,
-                'mark_vs_mid': score_mark_vs_mid,
-                'index_vs_mid': score_index_vs_mid,
-                'mark_vs_index': score_mark_vs_index
-            }
-        }
+    """
+    단순한 Consistency Checker
     
-
-    def check_spread_consistency(self, ticker_data: Dict, orderbook: OrderbookState) -> Dict:
-        """
-        Spread 일관성 체크
-
-        Returns:
-            {
-                'score': float, # 0~1
-                'spread_bps': float,
-                'category': str # 'excellent' | 'normal' | 'wide' | 'very_wide'
-            }
-        """
-        spread_info = OrderbookMetrics.calculate_spread(orderbook)
-
-        if spread_info is None:
-            return {'score': 0.0, 'spread_bps': 0, 'category': 'unknown'}
-        
-        spread_bps = spread_info['relative_spread_bps']
-
-        if spread_bps <= self.config.spread_excellent:
-            category='excellent'
-            score = 1.0
-        elif spread_bps <= self.config.spread_normal:
-            category='normal'
-            score = 1.0
-        elif spread_bps <= self.config.spread_wide:
-            category='wide'
-            score = 0.8
-        elif spread_bps <= self.config.spread_very_wide:
-            category='very_wide'
-            score=0.5
-        else:
-            category = 'very_wide'
-            score = max(0, 0.5 - (spread_bps - self.config.spread_very_wide) / 100)
-
-        return {
-            'score': score,
-            'spread_bps': spread_bps,
-            'category': category
-        }
+    원칙:
+    - Score 없음, Pass/Fail만
+    - Tolerance 없음, Sign만 체크
+    - 직관적인 질문들
+    """
     
-
-    def check_imbalance_vs_funding(self, ticker_data: Dict, orderbook: OrderbookState) -> Dict:
-        """
-        Imbalance vs Funding Rate 일관성 체크
-
-        Returns:
-            {
-                'score': float,    # 0~1
-                'funding_rate': float,
-                'imbalance': float,
-                'aligned': bool
-            }
-        """
-        imbalance_info = OrderbookMetrics.calculate_imbalance(orderbook)
-        funding_rate = ticker_data.get('funding_rate', 0)
-
-        volume_imbalance = imbalance_info['volume_imbalance']
-
-        # Funding rate와 imbalance의 방향 일치 여부
-        # funding_rate > 0: Long이 많음 -> bullish imbalance 기대
-        # funding_rate < 0: Short이 많음 -> bearish imbalance 기대
+    def check_all(self, 
+                  ticker_data: Dict, 
+                  orderbook: Optional['OrderbookState']) -> ConsistencyReport:
+        """모든 consistency check 수행"""
         
-        if funding_rate > 0 and volume_imbalance > 0:
-            # 둘다 bullish
-            aligned = True
-            score = min(1.0, abs(funding_rate) * 100 * abs(volume_imbalance))
-        elif funding_rate < 0 and volume_imbalance < 0:
-            # 둘다 bearish
-            aligned = True
-            score = min(1.0, abs(funding_rate) * 100 * abs(volume_imbalance))
-        elif abs(funding_rate) < 0.0001:
-            # Neutral
-            aligned = True
-            score = 1.0  - abs(volume_imbalance) * 0.5
-        else:
-            aligned = False
-            score = 0.5
-
-        return {
-            'score': score,
-            'funding_rate': funding_rate,
-            'imbalance': volume_imbalance,
-            'aligned': aligned
-        }
-    
-
-    def check_depth_adequacy(self, orderbook: OrderbookState) -> Dict:
-        """
-        Depth 충분성 체크
-
-        Returns:
-            {
-                'score': float,   # 0~1
-                'bid_depth': float,
-                'ask_depth': float,
-                'adequate': bool
-            }
-        """
-        depth_info = OrderbookMetrics.calculate_depth(orderbook)
-
-        bid_depth = depth_info['bid_depth']
-        ask_depth = depth_info['ask_depth']
-
-        # 최소 depth 기준
-        min_depth = self.config.min_depth_btc
-
-        # Bid/Ask 각각 평가
-        bid_score = min(1.0, bid_depth / min_depth) if min_depth > 0 else 0
-        ask_score = min(1.0, ask_depth / min_depth) if min_depth > 0 else 0
-
-        # Bid/Ask 균형 평가
-        total_depth = bid_depth + ask_depth
-        if total_depth > 0:
-            balance = 1 - abs(bid_depth - ask_depth) / total_depth
-        else:
-            balance = 0
-
-        # 전체 점수
-        score = (bid_score + ask_score) / 2 * balance
-
-        adequate = (bid_depth >= min_depth and ask_depth >= min_depth)
-
-        return {
-            'score': score,
-            'bid_depth': bid_depth,
-            'ask_depth': ask_depth,
-            'adequate': adequate
-        }
-    
-
-    def check_system_error_rate(self, 
-                                total_events: int,
-                                repairs: int,
-                                quarantines: int) -> Dict:
-        """
-        시스템 에러율 체크
+        checks = {}
         
-        Returns:
-            {
-                'score': float,  # 0~1
-                'error_rate': float,
-                'repairs': int,
-                'quarantines': int
-            }
-        """
-        if total_events == 0:
-            return {
-                'score': 1.0,
-                'error_rate': 0.0,
-                'repairs': 0,
-                'quarantines': 0
-            }
+        # 1. Orderbook 존재 여부
+        checks['orderbook_exists'] = self._check_orderbook_exists(orderbook)
         
-        error_rate = (repairs + quarantines) / total_events
+        if checks['orderbook_exists'] == CheckResult.FAIL:
+            # Orderbook 없으면 나머지는 SKIP
+            checks['spread_valid'] = CheckResult.SKIP
+            checks['price_in_spread'] = CheckResult.SKIP
+            checks['depth_balanced'] = CheckResult.SKIP
+            checks['funding_imbalance_aligned'] = CheckResult.SKIP
+            return ConsistencyReport(checks=checks)
         
-        # 에러율이 낮을수록 높은 점수
-        # 에러율 5% 이하: 1.0
-        # 에러율 10% 이상: 0.5 이하
-        score = max(0, 1.0 - error_rate * 5)
+        # 2. Spread가 유효한가? (crossed market 아닌가?)
+        checks['spread_valid'] = self._check_spread_valid(orderbook)
         
-        return {
-            'score': score,
-            'error_rate': error_rate,
-            'repairs': repairs,
-            'quarantines': quarantines
-        }
-    
-    def check_overall_consistency(self,
-                                  ticker_data: Dict,
-                                  orderbook: OrderbookState,
-                                  total_events: int,
-                                  repairs: int,
-                                  quarantines: int) -> Dict:
-        """
-        전체 일관성 체크 (5가지 차원 통합)
+        # 3. Last price가 bid-ask 사이에 있는가?
+        checks['price_in_spread'] = self._check_price_in_spread(ticker_data, orderbook)
         
-        Returns:
-            {
-                'overall_score': float,  # 0~1
-                'price': Dict,
-                'spread': Dict,
-                'imbalance_funding': Dict,
-                'depth': Dict,
-                'system': Dict
-            }
-        """
-        # 5가지 차원 체크
-        price_check = self.check_price_consistency(ticker_data, orderbook)
-        spread_check = self.check_spread_consistency(ticker_data, orderbook)
-        imbalance_check = self.check_imbalance_vs_funding(ticker_data, orderbook)
-        depth_check = self.check_depth_adequacy(orderbook)
-        system_check = self.check_system_error_rate(total_events, repairs, quarantines)
+        # 4. Bid/Ask depth가 둘 다 존재하는가?
+        checks['depth_balanced'] = self._check_depth_exists(orderbook)
         
-        # 가중 평균
-        weights = self.config.weights
-        overall_score = (
-            weights['price'] * price_check['score'] +
-            weights['spread'] * spread_check['score'] +
-            weights['imbalance_funding'] * imbalance_check['score'] +
-            weights['depth'] * depth_check['score'] +
-            weights['system'] * system_check['score']
+        # 5. Funding rate과 Imbalance 방향이 일치하는가?
+        checks['funding_imbalance_aligned'] = self._check_funding_imbalance_sign(
+            ticker_data, orderbook
         )
         
-        return {
-            'overall_score': overall_score,
-            'price': price_check,
-            'spread': spread_check,
-            'imbalance_funding': imbalance_check,
-            'depth': depth_check,
-            'system': system_check
-        }
+        return ConsistencyReport(checks=checks)
+    
+    
+    def _check_orderbook_exists(self, orderbook: Optional['OrderbookState']) -> CheckResult:
+        """Orderbook이 존재하고 비어있지 않은가?"""
+        if orderbook is None:
+            return CheckResult.FAIL
+        if not orderbook.bid_levels or not orderbook.ask_levels:
+            return CheckResult.FAIL
+        return CheckResult.PASS
+    
+    
+    def _check_spread_valid(self, orderbook: 'OrderbookState') -> CheckResult:
+        """
+        Spread가 유효한가?
+        - Best bid < Best ask (crossed market이 아닌가?)
+        """
+        best_bid = max(orderbook.bid_levels.keys())
+        best_ask = min(orderbook.ask_levels.keys())
+        
+        # Crossed market check
+        if best_bid >= best_ask:
+            return CheckResult.FAIL
+        
+        return CheckResult.PASS
+    
+    
+    def _check_price_in_spread(self, 
+                                ticker_data: Dict, 
+                                orderbook: 'OrderbookState') -> CheckResult:
+        """
+        Last price가 합리적인 범위에 있는가?
+        - best_bid <= last_price <= best_ask 이면 이상적
+        - 약간 벗어나도 괜찮지만, 너무 벗어나면 이상함
+        """
+        last_price = ticker_data.get('last_price')
+        if last_price is None:
+            return CheckResult.SKIP
+        
+        best_bid = max(orderbook.bid_levels.keys())
+        best_ask = min(orderbook.ask_levels.keys())
+        mid_price = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+        
+        # Last price가 spread의 N배 이상 벗어나면 FAIL
+        # 예: spread가 10이면, mid ± 50 범위를 벗어나면 이상
+        max_deviation = spread * 5
+        
+        if abs(last_price - mid_price) > max_deviation:
+            return CheckResult.FAIL
+        
+        return CheckResult.PASS
+    
+    
+    def _check_depth_exists(self, orderbook: 'OrderbookState') -> CheckResult:
+        """
+        Bid와 Ask 양쪽에 depth가 존재하는가?
+        - 한쪽만 있으면 FAIL
+        """
+        bid_depth = sum(orderbook.bid_levels.values())
+        ask_depth = sum(orderbook.ask_levels.values())
+        
+        if bid_depth <= 0 or ask_depth <= 0:
+            return CheckResult.FAIL
+        
+        return CheckResult.PASS
+    
+    
+    def _check_funding_imbalance_sign(self, 
+                                       ticker_data: Dict, 
+                                       orderbook: 'OrderbookState') -> CheckResult:
+        """
+        Funding rate과 Orderbook imbalance의 부호가 일치하는가?
+        
+        논리:
+        - Funding > 0 (롱이 숏에게 지불) → 롱 포지션 많음 → bid pressure 예상
+        - Funding < 0 (숏이 롱에게 지불) → 숏 포지션 많음 → ask pressure 예상
+        
+        Sign만 체크, 크기는 무시
+        """
+        funding_rate = ticker_data.get('funding_rate')
+        if funding_rate is None:
+            return CheckResult.SKIP
+        
+        # Orderbook imbalance 계산 (bid - ask) / (bid + ask)
+        bid_depth = sum(orderbook.bid_levels.values())
+        ask_depth = sum(orderbook.ask_levels.values())
+        total = bid_depth + ask_depth
+        
+        if total == 0:
+            return CheckResult.SKIP
+        
+        imbalance = (bid_depth - ask_depth) / total  # 양수면 bid 우세
+        
+        # 둘 다 0에 가까우면 (중립) PASS
+        if abs(funding_rate) < 0.0001 and abs(imbalance) < 0.1:
+            return CheckResult.PASS
+        
+        # Sign 일치 여부만 체크
+        # funding > 0 이면 imbalance > 0 이어야 함
+        funding_sign = 1 if funding_rate > 0 else (-1 if funding_rate < 0 else 0)
+        imbalance_sign = 1 if imbalance > 0.1 else (-1 if imbalance < -0.1 else 0)
+        
+        # 같은 부호이거나 둘 중 하나가 중립이면 PASS
+        if funding_sign == 0 or imbalance_sign == 0:
+            return CheckResult.PASS
+        if funding_sign == imbalance_sign:
+            return CheckResult.PASS
+        
+        return CheckResult.FAIL

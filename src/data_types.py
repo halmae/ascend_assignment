@@ -36,7 +36,59 @@ class OrderbookState:
         sorted_levels = sorted(levels.items(), key=lambda x: x[0], reverse=(side=='bid'))
         return sum(amount for _, amount in sorted_levels[:n])
 
+    def get_best_bid(self) -> Optional[float]:
+        """
+        Best bid price 반환
+        
+        Returns:
+            최고 매수 호가 (가장 높은 bid price) 또는 None
+        """
+        if not self.bid_levels:
+            return None
+        return max(self.bid_levels.keys())
     
+    def get_best_ask(self) -> Optional[float]:
+        """
+        Best ask price 반환
+        
+        Returns:
+            최저 매도 호가 (가장 낮은 ask price) 또는 None
+        """
+        if not self.ask_levels:
+            return None
+        return min(self.ask_levels.keys())
+    
+    def get_mid_price(self) -> Optional[float]:
+        """
+        Mid price 계산
+        
+        Returns:
+            (best_bid + best_ask) / 2 또는 None
+        """
+        best_bid = self.get_best_bid()
+        best_ask = self.get_best_ask()
+        
+        if best_bid is None or best_ask is None:
+            return None
+        
+        return (best_bid + best_ask) / 2
+    
+    def get_spread(self) -> Optional[float]:
+        """
+        Spread 계산
+        
+        Returns:
+            best_ask - best_bid 또는 None
+        """
+        best_bid = self.get_best_bid()
+        best_ask = self.get_best_ask()
+        
+        if best_bid is None or best_ask is None:
+            return None
+        
+        return best_ask - best_bid
+
+
     def clone(self, new_timestamp: int) -> 'OrderbookState':
         """
         Orderbook 복사
