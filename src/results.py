@@ -1,248 +1,270 @@
 """
-처리 결과 구조화 모듈
-Research vs Validation 비교 분석용
+처리 결과 및 비교 분석 모듈 (v2 - 3-State Architecture 지원)
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+from pathlib import Path
 import json
 
 
 @dataclass
 class ProcessingResult:
-    """처리 결과 요약"""
+    """처리 결과"""
     
-    # 메타 정보
     dataset_name: str = ""
     processing_time_sec: float = 0.0
     
     # 기본 통계
-    total_events: int = 0
-    total_trades: int = 0
-    total_tickers: int = 0
-    total_orderbook_updates: int = 0
-    total_snapshots: int = 0
+    stats: Dict[str, int] = field(default_factory=dict)
     
-    # Trade Validation 결과
-    trade_accepts: int = 0
-    trade_quarantines: int = 0
-    
-    # Drop 통계 (stale 이벤트)
-    events_dropped: int = 0
-    orderbook_dropped: int = 0
-    trades_dropped: int = 0
-    
-    # Consistency Check 결과 (3가지)
-    check_failures: Dict[str, int] = field(default_factory=lambda: {
-        'spread_valid': 0,
-        'price_in_spread': 0,
-        'funding_imbalance_aligned': 0
-    })
-    
-    check_passes: Dict[str, int] = field(default_factory=lambda: {
-        'spread_valid': 0,
-        'price_in_spread': 0,
-        'funding_imbalance_aligned': 0
-    })
-    
-    # State 분포
-    state_counts: Dict[str, int] = field(default_factory=lambda: {
-        'TRUSTED': 0,
-        'DEGRADED': 0,
-        'UNTRUSTED': 0
-    })
+    # Tradability 분포 (기존 호환성)
+    tradability_counts: Dict[str, int] = field(default_factory=dict)
     
     # State 전이 기록
     state_transitions: List[Dict] = field(default_factory=list)
     
-    # Lateness 통계 (이벤트 타입별)
-    lateness_stats: Dict[str, Dict] = field(default_factory=dict)
-    avg_lateness_by_type: Dict[str, float] = field(default_factory=dict)
+    # Uncertainty 로그
+    uncertainty_log: List[Dict] = field(default_factory=list)
     
-    # ====== 계산 속성들 ======
+    # 최종 Uncertainty
+    final_uncertainty: Dict = field(default_factory=dict)
     
-    @property
-    def trade_accept_rate(self) -> float:
-        total = self.trade_accepts + self.trade_quarantines
-        return self.trade_accepts / total if total > 0 else 0.0
+    # === NEW: 3-State Architecture ===
+    decision_counts: Dict[str, int] = field(default_factory=dict)
+    decisions_log: List[Dict] = field(default_factory=list)
+    state_evaluator_summary: Dict = field(default_factory=dict)
     
-    @property
-    def trade_quarantine_rate(self) -> float:
-        total = self.trade_accepts + self.trade_quarantines
-        return self.trade_quarantines / total if total > 0 else 0.0
+    # ====== 계산 속성 ======
     
     @property
-    def orderbook_drop_rate(self) -> float:
-        total = self.total_orderbook_updates + self.orderbook_dropped
-        return self.orderbook_dropped / total if total > 0 else 0.0
+    def total_tickers(self) -> int:
+        return self.stats.get('ticker_checkpoints', 0)
     
     @property
-    def trade_drop_rate(self) -> float:
-        total = self.total_trades + self.trades_dropped
-        return self.trades_dropped / total if total > 0 else 0.0
+    def tradable_rate(self) -> float:
+        total = sum(self.tradability_counts.values())
+        return self.tradability_counts.get('TRADABLE', 0) / total if total > 0 else 0.0
     
     @property
-    def trusted_rate(self) -> float:
-        total = sum(self.state_counts.values())
-        return self.state_counts['TRUSTED'] / total if total > 0 else 0.0
+    def restricted_rate(self) -> float:
+        total = sum(self.tradability_counts.values())
+        return self.tradability_counts.get('RESTRICTED', 0) / total if total > 0 else 0.0
     
     @property
-    def degraded_rate(self) -> float:
-        total = sum(self.state_counts.values())
-        return self.state_counts['DEGRADED'] / total if total > 0 else 0.0
+    def not_tradable_rate(self) -> float:
+        total = sum(self.tradability_counts.values())
+        return self.tradability_counts.get('NOT_TRADABLE', 0) / total if total > 0 else 0.0
     
     @property
-    def untrusted_rate(self) -> float:
-        total = sum(self.state_counts.values())
-        return self.state_counts['UNTRUSTED'] / total if total > 0 else 0.0
+    def trade_validity_rate(self) -> float:
+        valid = self.stats.get('trades_valid', 0)
+        invalid = self.stats.get('trades_invalid', 0)
+        total = valid + invalid
+        return valid / total if total > 0 else 0.0
     
-    def get_check_fail_rate(self, check_name: str) -> float:
-        passes = self.check_passes.get(check_name, 0)
-        fails = self.check_failures.get(check_name, 0)
-        total = passes + fails
-        return fails / total if total > 0 else 0.0
+    # === NEW: 3-State 속성 ===
+    @property
+    def allowed_rate(self) -> float:
+        total = sum(self.decision_counts.values()) if self.decision_counts else 0
+        return self.decision_counts.get('ALLOWED', 0) / total if total > 0 else 0.0
     
-    def get_avg_lateness(self, event_type: str) -> float:
-        return self.avg_lateness_by_type.get(event_type, 0.0)
+    @property
+    def decision_restricted_rate(self) -> float:
+        total = sum(self.decision_counts.values()) if self.decision_counts else 0
+        return self.decision_counts.get('RESTRICTED', 0) / total if total > 0 else 0.0
     
-    def get_max_lateness(self, event_type: str) -> float:
-        if event_type in self.lateness_stats:
-            return self.lateness_stats[event_type].get('max_ms', 0.0)
-        return 0.0
+    @property
+    def halted_rate(self) -> float:
+        total = sum(self.decision_counts.values()) if self.decision_counts else 0
+        return self.decision_counts.get('HALTED', 0) / total if total > 0 else 0.0
     
-    # ====== 출력 메서드들 ======
-    
-    def to_dict(self) -> Dict:
-        return {
-            'dataset_name': self.dataset_name,
-            'processing_time_sec': self.processing_time_sec,
-            'total_events': self.total_events,
-            'total_trades': self.total_trades,
-            'total_tickers': self.total_tickers,
-            'trade_accept_rate': self.trade_accept_rate,
-            'trade_quarantine_rate': self.trade_quarantine_rate,
-            'orderbook_drop_rate': self.orderbook_drop_rate,
-            'trade_drop_rate': self.trade_drop_rate,
-            'check_failures': self.check_failures,
-            'state_counts': self.state_counts,
-            'lateness_stats': self.lateness_stats,
-        }
-    
-    def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
+    # ====== 출력 ======
     
     def print_summary(self):
-        print(f"\n{'='*60}")
-        print(f"📊 Processing Result: {self.dataset_name}")
-        print(f"{'='*60}")
+        print(f"\n{'='*70}")
+        print(f"📊 Effective Orderbook Analysis: {self.dataset_name}")
+        print(f"{'='*70}")
         
         print(f"\n[기본 통계]")
-        print(f"  총 이벤트: {self.total_events:,}")
-        print(f"  - Trades: {self.total_trades:,}")
-        print(f"  - Tickers: {self.total_tickers:,}")
-        print(f"  - Orderbook Updates: {self.total_orderbook_updates:,}")
-        print(f"  - Snapshots: {self.total_snapshots:,}")
         print(f"  처리 시간: {self.processing_time_sec:.2f}초")
+        for key, value in self.stats.items():
+            print(f"  {key}: {value:,}")
         
-        print(f"\n[Event Drop (Stale 이벤트)]")
-        print(f"  Orderbook dropped: {self.orderbook_dropped:,} ({self.orderbook_drop_rate:.2%})")
-        print(f"  Trades dropped: {self.trades_dropped:,} ({self.trade_drop_rate:.2%})")
+        print(f"\n[Trade Validity]")
+        valid = self.stats.get('trades_valid', 0)
+        invalid = self.stats.get('trades_invalid', 0)
+        print(f"  Valid: {valid:,} ({self.trade_validity_rate:.1%})")
+        print(f"  Invalid: {invalid:,} ({1-self.trade_validity_rate:.1%})")
         
-        print(f"\n[Event Lateness (ms)]")
-        for event_type in ['orderbook', 'trade', 'ticker']:
-            avg = self.get_avg_lateness(event_type)
-            max_val = self.get_max_lateness(event_type)
-            print(f"  {event_type}: avg={avg:.2f}, max={max_val:.2f}")
+        # === NEW: 3-State 분포 ===
+        if self.decision_counts:
+            print(f"\n[3-State Decision 분포]")
+            total = sum(self.decision_counts.values())
+            for state, count in self.decision_counts.items():
+                pct = count / total * 100 if total > 0 else 0
+                bar = '█' * int(pct / 2)
+                print(f"  {state:15s}: {count:>6,} ({pct:>5.1f}%) {bar}")
         
-        print(f"\n[Trade Validation]")
-        print(f"  Accept: {self.trade_accepts:,} ({self.trade_accept_rate:.1%})")
-        print(f"  Quarantine: {self.trade_quarantines:,} ({self.trade_quarantine_rate:.1%})")
+        # 기존 Tradability (호환성)
+        print(f"\n[Tradability 분포 (호환)]")
+        total = sum(self.tradability_counts.values())
+        for state, count in self.tradability_counts.items():
+            pct = count / total * 100 if total > 0 else 0
+            bar = '█' * int(pct / 2)
+            print(f"  {state:15s}: {count:>6,} ({pct:>5.1f}%) {bar}")
         
-        print(f"\n[Consistency Check 실패율] (Effective Orderbook 기준)")
-        for check_name in self.check_failures.keys():
-            fail_rate = self.get_check_fail_rate(check_name)
-            fails = self.check_failures[check_name]
-            emoji = "✅" if fail_rate < 0.01 else "⚠️" if fail_rate < 0.05 else "❌"
-            print(f"  {emoji} {check_name}: {fails:,} fails ({fail_rate:.2%})")
+        print(f"\n[State 전이 횟수]")
+        print(f"  총 전이: {len(self.state_transitions)}회")
         
-        print(f"\n[State 분포]")
-        print(f"  TRUSTED: {self.state_counts['TRUSTED']:,} ({self.trusted_rate:.1%})")
-        print(f"  DEGRADED: {self.state_counts['DEGRADED']:,} ({self.degraded_rate:.1%})")
-        print(f"  UNTRUSTED: {self.state_counts['UNTRUSTED']:,} ({self.untrusted_rate:.1%})")
+        # 판단 중단(HALT) 통계
+        if self.decisions_log:
+            halt_count = sum(1 for d in self.decisions_log if d.get('action') == 'HALT')
+            restrict_count = sum(1 for d in self.decisions_log if d.get('action') == 'RESTRICT')
+            print(f"  HALT 발생: {halt_count}회")
+            print(f"  RESTRICT 발생: {restrict_count}회")
+        
+        if self.final_uncertainty:
+            print(f"\n[최종 상태]")
+            u = self.final_uncertainty
+            print(f"  Data Trust: {u.get('data_trust', 'N/A')}")
+            print(f"  Hypothesis: {u.get('hypothesis', 'N/A')}")
+            print(f"  Decision: {u.get('decision', 'N/A')}")
+            if 'freshness' in u:
+                f = u['freshness']
+                print(f"  Freshness: avg={f.get('avg_lateness_ms', 0):.1f}ms, "
+                      f"stale_ratio={f.get('stale_ratio', 0):.2%}")
+            if 'integrity' in u:
+                i = u['integrity']
+                print(f"  Integrity: spread_valid={i.get('spread_valid', 'N/A')}, "
+                      f"failures={i.get('failure_count', 0)}")
+            if 'stability' in u:
+                s = u['stability']
+                print(f"  Stability: spread_vol={s.get('spread_volatility', 0):.4f}")
+    
+    def to_json(self, filepath: str):
+        """결과를 JSON으로 저장"""
+        data = {
+            'dataset_name': self.dataset_name,
+            'processing_time_sec': self.processing_time_sec,
+            'stats': self.stats,
+            'tradability_counts': self.tradability_counts,
+            'tradable_rate': self.tradable_rate,
+            'restricted_rate': self.restricted_rate,
+            'not_tradable_rate': self.not_tradable_rate,
+            'trade_validity_rate': self.trade_validity_rate,
+            # 3-State
+            'decision_counts': self.decision_counts,
+            'allowed_rate': self.allowed_rate,
+            'halted_rate': self.halted_rate,
+            # Legacy
+            'state_transitions': self.state_transitions,
+            'uncertainty_log': self.uncertainty_log,
+            'final_uncertainty': self.final_uncertainty
+        }
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    def save_outputs(self, output_dir: str):
+        """
+        과제 요구사항에 맞는 출력 파일 생성
+        
+        /output/
+        ├── state_transitions.jsonl    # 상태 전이 로그
+        ├── decisions.jsonl            # 판단 허용/제한/중단 기록
+        └── summary.json               # 실행 요약
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # 1. state_transitions.jsonl
+        transitions_file = output_path / "state_transitions.jsonl"
+        with open(transitions_file, 'w') as f:
+            for transition in self.state_transitions:
+                f.write(json.dumps(transition) + '\n')
+        print(f"  ✅ {transitions_file} ({len(self.state_transitions)} records)")
+        
+        # 2. decisions.jsonl
+        decisions_file = output_path / "decisions.jsonl"
+        with open(decisions_file, 'w') as f:
+            for decision in self.decisions_log:
+                f.write(json.dumps(decision) + '\n')
+        print(f"  ✅ {decisions_file} ({len(self.decisions_log)} records)")
+        
+        # 3. summary.json
+        summary_file = output_path / "summary.json"
+        summary = {
+            'dataset_name': self.dataset_name,
+            'processing_time_sec': self.processing_time_sec,
+            'stats': self.stats,
+            'decision_distribution': {
+                'counts': self.decision_counts,
+                'rates': {
+                    'ALLOWED': self.allowed_rate,
+                    'RESTRICTED': self.decision_restricted_rate,
+                    'HALTED': self.halted_rate
+                }
+            },
+            'tradability_distribution': {
+                'counts': self.tradability_counts,
+                'rates': {
+                    'TRADABLE': self.tradable_rate,
+                    'RESTRICTED': self.restricted_rate,
+                    'NOT_TRADABLE': self.not_tradable_rate
+                }
+            },
+            'trade_validity_rate': self.trade_validity_rate,
+            'state_transitions_count': len(self.state_transitions),
+            'decisions_count': {
+                'HALT': sum(1 for d in self.decisions_log if d.get('action') == 'HALT'),
+                'RESTRICT': sum(1 for d in self.decisions_log if d.get('action') == 'RESTRICT')
+            },
+            'final_state': self.final_uncertainty
+        }
+        with open(summary_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+        print(f"  ✅ {summary_file}")
 
 
 def compare_results(research: ProcessingResult, validation: ProcessingResult):
-    """Research와 Validation 결과 비교"""
-    print(f"\n{'='*70}")
-    print(f"📊 Research vs Validation 비교")
-    print(f"{'='*70}")
+    """Research와 Validation 비교"""
+    print(f"\n{'='*75}")
+    print(f"📊 Effective Orderbook: Research vs Validation")
+    print(f"{'='*75}")
     
-    # 헤더
     print(f"\n{'지표':<40} {'Research':>12} {'Validation':>12} {'차이':>10}")
     print(f"{'-'*75}")
     
-    # Trade Validation
-    print(f"{'Trade Accept Rate':<40} {research.trade_accept_rate:>11.1%} {validation.trade_accept_rate:>11.1%} {validation.trade_accept_rate - research.trade_accept_rate:>+9.1%}")
-    print(f"{'Trade Quarantine Rate':<40} {research.trade_quarantine_rate:>11.1%} {validation.trade_quarantine_rate:>11.1%} {validation.trade_quarantine_rate - research.trade_quarantine_rate:>+9.1%}")
+    # Trade Validity
+    print(f"{'Trade Validity Rate':<40} {research.trade_validity_rate:>11.1%} {validation.trade_validity_rate:>11.1%} {validation.trade_validity_rate - research.trade_validity_rate:>+9.1%}")
     
     print(f"{'-'*75}")
     
-    # Drop Rate
-    print(f"{'Orderbook Drop Rate (stale)':<40} {research.orderbook_drop_rate:>11.2%} {validation.orderbook_drop_rate:>11.2%} {validation.orderbook_drop_rate - research.orderbook_drop_rate:>+9.2%}")
-    print(f"{'Trade Drop Rate (stale)':<40} {research.trade_drop_rate:>11.2%} {validation.trade_drop_rate:>11.2%} {validation.trade_drop_rate - research.trade_drop_rate:>+9.2%}")
+    # Tradability
+    print(f"{'TRADABLE %':<40} {research.tradable_rate:>11.1%} {validation.tradable_rate:>11.1%} {validation.tradable_rate - research.tradable_rate:>+9.1%}")
+    print(f"{'RESTRICTED %':<40} {research.restricted_rate:>11.1%} {validation.restricted_rate:>11.1%} {validation.restricted_rate - research.restricted_rate:>+9.1%}")
+    print(f"{'NOT_TRADABLE %':<40} {research.not_tradable_rate:>11.1%} {validation.not_tradable_rate:>11.1%} {validation.not_tradable_rate - research.not_tradable_rate:>+9.1%}")
     
     print(f"{'-'*75}")
     
-    # Lateness
-    print(f"{'Orderbook Avg Lateness (ms)':<40} {research.get_avg_lateness('orderbook'):>11.2f} {validation.get_avg_lateness('orderbook'):>11.2f} {validation.get_avg_lateness('orderbook') - research.get_avg_lateness('orderbook'):>+9.2f}")
-    print(f"{'Orderbook Max Lateness (ms)':<40} {research.get_max_lateness('orderbook'):>11.2f} {validation.get_max_lateness('orderbook'):>11.2f} {validation.get_max_lateness('orderbook') - research.get_max_lateness('orderbook'):>+9.2f}")
-    print(f"{'Trade Avg Lateness (ms)':<40} {research.get_avg_lateness('trade'):>11.2f} {validation.get_avg_lateness('trade'):>11.2f} {validation.get_avg_lateness('trade') - research.get_avg_lateness('trade'):>+9.2f}")
-    
-    print(f"{'-'*75}")
-    
-    # Consistency Check 실패율
-    for check_name in research.check_failures.keys():
-        r_rate = research.get_check_fail_rate(check_name)
-        v_rate = validation.get_check_fail_rate(check_name)
-        diff = v_rate - r_rate
-        print(f"{check_name + ' fail rate':<40} {r_rate:>11.2%} {v_rate:>11.2%} {diff:>+9.2%}")
-    
-    print(f"{'-'*75}")
-    
-    # State 분포
-    print(f"{'TRUSTED %':<40} {research.trusted_rate:>11.1%} {validation.trusted_rate:>11.1%} {validation.trusted_rate - research.trusted_rate:>+9.1%}")
-    print(f"{'DEGRADED %':<40} {research.degraded_rate:>11.1%} {validation.degraded_rate:>11.1%} {validation.degraded_rate - research.degraded_rate:>+9.1%}")
-    print(f"{'UNTRUSTED %':<40} {research.untrusted_rate:>11.1%} {validation.untrusted_rate:>11.1%} {validation.untrusted_rate - research.untrusted_rate:>+9.1%}")
+    # State 전이
+    print(f"{'State Transitions':<40} {len(research.state_transitions):>11,} {len(validation.state_transitions):>11,}")
     
     print(f"\n{'='*75}")
     
-    # 핵심 인사이트
+    # 인사이트
     print(f"\n[핵심 인사이트]")
     
-    # Drop rate 차이
-    ob_drop_diff = validation.orderbook_drop_rate - research.orderbook_drop_rate
-    if ob_drop_diff > 0.01:
-        print(f"  ⚠️ Validation에서 Orderbook Drop Rate가 {ob_drop_diff:.2%}p 높음 → Stale 이벤트 많음")
+    tv_diff = validation.trade_validity_rate - research.trade_validity_rate
+    if tv_diff < -0.05:
+        print(f"  ⚠️ Validation에서 Trade Validity가 {-tv_diff:.1%}p 낮음 → Dirty Data 영향")
     
-    # Quarantine rate 차이
-    q_diff = validation.trade_quarantine_rate - research.trade_quarantine_rate
-    if q_diff > 0.01:
-        print(f"  ⚠️ Validation에서 Trade Quarantine이 {q_diff:.1%}p 높음")
+    t_diff = validation.tradable_rate - research.tradable_rate
+    if t_diff < -0.05:
+        print(f"  ⚠️ Validation에서 TRADABLE이 {-t_diff:.1%}p 낮음 → Uncertainty 증가")
     
-    # UNTRUSTED 증가
-    u_diff = validation.untrusted_rate - research.untrusted_rate
-    if u_diff > 0.01:
-        print(f"  ⚠️ Validation에서 UNTRUSTED 상태가 {u_diff:.1%}p 높음")
+    nt_diff = validation.not_tradable_rate - research.not_tradable_rate
+    if nt_diff > 0.05:
+        print(f"  ⚠️ Validation에서 NOT_TRADABLE이 {nt_diff:.1%}p 높음 → 판단 중단 구간 증가")
     
-    # 가장 많이 실패한 체크
-    max_fail_check = max(
-        validation.check_failures.keys(),
-        key=lambda k: validation.get_check_fail_rate(k)
-    )
-    max_fail_rate = validation.get_check_fail_rate(max_fail_check)
-    if max_fail_rate > 0.01:
-        print(f"  ⚠️ 가장 많이 실패한 체크: {max_fail_check} ({max_fail_rate:.2%})")
-    
-    # Drop rate이 높은데 Consistency가 좋으면
-    if validation.orderbook_drop_rate > research.orderbook_drop_rate:
-        if validation.trusted_rate >= research.trusted_rate * 0.9:
-            print(f"  ✅ Stale 이벤트 필터링으로 Effective OB 품질 유지됨")
+    if validation.tradable_rate >= 0.8:
+        print(f"  ✅ Validation에서도 80% 이상 TRADABLE 유지")

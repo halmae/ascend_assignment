@@ -1,205 +1,249 @@
 """
-실시간 스트림 처리 엔진 (Event Lateness 기반 필터링)
+Effective Orderbook State Processor (v2 - 3-State Architecture)
 
 핵심 개념:
-- lateness = local_timestamp - timestamp (이벤트 수신 지연)
-- lateness가 큰 이벤트는 "stale"하므로 버림
-- Effective Orderbook = stale 이벤트 제외된 Orderbook
-- 이 Effective OB의 consistency를 평가
+- Effective Orderbook = (Orderbook Structure, Uncertainty Vector U_t)
+- 3-State Architecture:
+  1. Data Trust State: 데이터 신뢰도 (TRUSTED/DEGRADED/UNTRUSTED)
+  2. Hypothesis Validity State: 가설 유효성 (VALID/WEAKENING/INVALID)
+  3. Decision Permission State: 판단 허용 (ALLOWED/RESTRICTED/HALTED)
+
+Uncertainty Vector:
+- Freshness: 데이터가 얼마나 신선한가?
+- Integrity: 데이터가 서로 일관성이 있는가?
+- Stability: Orderbook이 안정적인가? (특히 Liquidation 이후)
+
+중요: Orderbook에는 모든 이벤트 적용 (drop 없음)
+      Lateness는 Uncertainty metric으로만 사용
 """
 import time
+import json
 from collections import deque
 from typing import List, Optional, Dict, Deque
+from dataclasses import dataclass
 
-from src.enums import EventType, DataTrustState, RepairAction
+from src.enums import EventType, DataTrustState, HypothesisValidityState, DecisionPermissionState, RepairAction
 from src.data_types import Event, OrderbookState
-from src.consistency import ConsistencyChecker, CheckResult, ConsistencyReport
-from src.orderbook import OrderbookMetrics
+from src.consistency import ConsistencyChecker
+from src.uncertainty import (
+    UncertaintyVector, 
+    FreshnessUncertainty, 
+    IntegrityUncertainty, 
+    StabilityUncertainty,
+    TradabilityState
+)
+from src.state_machine import StateEvaluator, SystemState, StateThresholds
 from src.results import ProcessingResult
 
 
-class StreamProcessor:
-    """실시간 스트림 처리 엔진"""
+@dataclass
+class LatencyWindow:
+    """최근 N개 이벤트의 latency 추적"""
+    window_size: int = 1000
+    latencies: Deque[float] = None
+    stale_threshold_ms: float = 50.0  # 이 이상이면 "stale"로 간주 (측정용)
+    
+    def __post_init__(self):
+        if self.latencies is None:
+            self.latencies = deque(maxlen=self.window_size)
+    
+    def add(self, latency_ms: float):
+        self.latencies.append(latency_ms)
+    
+    def get_avg(self) -> float:
+        if not self.latencies:
+            return 0.0
+        return sum(self.latencies) / len(self.latencies)
+    
+    def get_max(self) -> float:
+        if not self.latencies:
+            return 0.0
+        return max(self.latencies)
+    
+    def get_stale_ratio(self) -> float:
+        if not self.latencies:
+            return 0.0
+        stale_count = sum(1 for l in self.latencies if l > self.stale_threshold_ms)
+        return stale_count / len(self.latencies)
+
+
+@dataclass
+class SpreadHistory:
+    """Spread/Imbalance 변동성 추적"""
+    window_size: int = 100
+    spreads: Deque[float] = None
+    imbalances: Deque[float] = None
+    mid_prices: Deque[float] = None
+    
+    def __post_init__(self):
+        if self.spreads is None:
+            self.spreads = deque(maxlen=self.window_size)
+        if self.imbalances is None:
+            self.imbalances = deque(maxlen=self.window_size)
+        if self.mid_prices is None:
+            self.mid_prices = deque(maxlen=self.window_size)
+    
+    def add(self, spread: float, imbalance: float, mid_price: float):
+        self.spreads.append(spread)
+        self.imbalances.append(imbalance)
+        self.mid_prices.append(mid_price)
+    
+    def get_spread_volatility(self) -> float:
+        """Spread의 변동계수 (CV)"""
+        if len(self.spreads) < 2:
+            return 0.0
+        avg = sum(self.spreads) / len(self.spreads)
+        if avg == 0:
+            return 0.0
+        variance = sum((s - avg) ** 2 for s in self.spreads) / len(self.spreads)
+        return (variance ** 0.5) / avg
+    
+    def get_imbalance_volatility(self) -> float:
+        """Imbalance의 표준편차"""
+        if len(self.imbalances) < 2:
+            return 0.0
+        avg = sum(self.imbalances) / len(self.imbalances)
+        variance = sum((i - avg) ** 2 for i in self.imbalances) / len(self.imbalances)
+        return variance ** 0.5
+    
+    def get_mid_price_volatility(self) -> float:
+        """Mid price의 변동계수"""
+        if len(self.mid_prices) < 2:
+            return 0.0
+        avg = sum(self.mid_prices) / len(self.mid_prices)
+        if avg == 0:
+            return 0.0
+        variance = sum((p - avg) ** 2 for p in self.mid_prices) / len(self.mid_prices)
+        return (variance ** 0.5) / avg
+
+
+class EffectiveOrderbookProcessor:
+    """
+    Effective Orderbook State Processor (v2)
+    
+    3-State Architecture를 적용한 실시간 스트림 처리기
+    """
 
     def __init__(self,
+                 dataset_name: str = "",
                  buffer_size: int = 1000,
                  watermark_delay_ms: int = 50,
                  snapshot_buffer_size: int = 5,
-                 dataset_name: str = "",
                  max_orderbook_levels: int = 500,
-                 max_event_lateness_ms: float = 100.0):
+                 stale_threshold_ms: float = 50.0,
+                 liquidation_cooldown_ms: float = 5000.0,
+                 state_thresholds: Optional[StateThresholds] = None):
         """
         Args:
-            buffer_size: 메인 버퍼 크기
-            watermark_delay_ms: Watermark 지연 시간 (ms)
-            snapshot_buffer_size: Snapshot 버퍼 크기
-            dataset_name: 데이터셋 이름 (결과 식별용)
-            max_orderbook_levels: Orderbook 최대 레벨 수
-            max_event_lateness_ms: 이벤트 최대 허용 lateness (ms)
-                                   초과시 이벤트를 버림
+            stale_threshold_ms: 이 이상의 latency는 "stale"로 측정 (drop 아님)
+            liquidation_cooldown_ms: Liquidation 이후 안정화 대기 시간
+            state_thresholds: 상태 전이 임계값 (None이면 기본값 사용)
         """
+        self.dataset_name = dataset_name
         self.buffer_size = buffer_size
         self.watermark_delay_ms = watermark_delay_ms
         self.snapshot_buffer_size = snapshot_buffer_size
-        self.dataset_name = dataset_name
         self.max_orderbook_levels = max_orderbook_levels
-        self.max_event_lateness_ms = max_event_lateness_ms
+        self.stale_threshold_ms = stale_threshold_ms
+        self.liquidation_cooldown_ms = liquidation_cooldown_ms
 
         # Buffers
         self.main_buffer: List[Event] = []
         self.snapshot_buffer: Deque[Event] = deque(maxlen=snapshot_buffer_size)
 
-        # Orderbook state (Effective Orderbook)
+        # Orderbook State (모든 이벤트 적용 - drop 없음)
         self.current_orderbook: Optional[OrderbookState] = None
-        self.prev_orderbook: Optional[OrderbookState] = None
-
-        # System state
-        self.data_trust_state = DataTrustState.UNTRUSTED
         self.initialized = False
+
+        # Uncertainty 추적
+        self.ob_latency_window = LatencyWindow(stale_threshold_ms=stale_threshold_ms)
+        self.trade_latency_window = LatencyWindow(stale_threshold_ms=stale_threshold_ms)
+        self.spread_history = SpreadHistory()
+        
+        # Liquidation 추적
+        self.last_liquidation_ts: Optional[int] = None
+        self.last_liquidation_size: float = 0.0
+        
+        # Integrity 추적 (최근 윈도우)
+        self.integrity_window_size = 100
+        self.integrity_results: Deque[IntegrityUncertainty] = deque(maxlen=self.integrity_window_size)
+
+        # Current Uncertainty Vector
+        self.current_uncertainty = UncertaintyVector()
+        
+        # Consistency Checker
+        self.consistency_checker = ConsistencyChecker()
+        
+        # === NEW: 3-State Architecture ===
+        self.state_evaluator = StateEvaluator(thresholds=state_thresholds)
+        self.current_system_state = SystemState()
+        
+        # Decision 로그 (decisions.jsonl용)
+        self.decisions_log: List[Dict] = []
 
         # Statistics
         self.stats = {
-            'events_received': 0,
             'events_processed': 0,
-            'events_dropped': 0,  # lateness 초과로 버린 이벤트
-            'trades_processed': 0,
-            'trades_dropped': 0,
             'orderbook_updates': 0,
-            'orderbook_dropped': 0,
+            'trades_processed': 0,
+            'trades_valid': 0,
+            'trades_invalid': 0,
             'ticker_checkpoints': 0,
-            'snapshots_received': 0,
+            'liquidations_processed': 0,
             'snapshots_used': 0,
-            'trade_accepts': 0,
-            'trade_quarantines': 0,
         }
         
-        # Event Lateness 통계 (이벤트 타입별)
-        self.lateness_stats = {
-            'orderbook': {
-                'count': 0,
-                'sum_ms': 0.0,
-                'max_ms': 0.0,
-                'dropped': 0,
-            },
-            'trade': {
-                'count': 0,
-                'sum_ms': 0.0,
-                'max_ms': 0.0,
-                'dropped': 0,
-            },
-            'ticker': {
-                'count': 0,
-                'sum_ms': 0.0,
-                'max_ms': 0.0,
-                'dropped': 0,
-            },
+        # State 분포 (3-State)
+        self.decision_counts = {
+            'ALLOWED': 0,
+            'RESTRICTED': 0,
+            'HALTED': 0
         }
         
-        # Consistency Check 통계 (3가지)
-        self.check_stats = {
-            'passes': {
-                'spread_valid': 0,
-                'price_in_spread': 0,
-                'funding_imbalance_aligned': 0
-            },
-            'failures': {
-                'spread_valid': 0,
-                'price_in_spread': 0,
-                'funding_imbalance_aligned': 0
-            }
+        # 기존 Tradability 분포 (호환성 유지)
+        self.tradability_counts = {
+            'TRADABLE': 0,
+            'RESTRICTED': 0,
+            'NOT_TRADABLE': 0
         }
         
-        # State 분포
-        self.state_counts = {
-            'TRUSTED': 0,
-            'DEGRADED': 0,
-            'UNTRUSTED': 0
-        }
-        
-        # State 전이 기록
+        # State 전이 로그 (state_transitions.jsonl용)
         self.state_transitions: List[Dict] = []
-
-        # Consistency Checker
-        self.consistency_checker = ConsistencyChecker()
+        
+        # Uncertainty 로그 (샘플링)
+        self.uncertainty_log: List[Dict] = []
+        self.log_interval = 100  # 100 ticker마다 로깅
 
         # Watermark
         self.last_watermark = None
         self.last_ticker_ts = None
         
-        # 처리 시작 시간
         self.start_time = None
-
-
-    def _calculate_lateness_ms(self, event: Event) -> float:
-        """
-        이벤트의 lateness 계산 (ms)
-        
-        lateness = local_timestamp - timestamp
-                 = 수신 시점 - 발생 시점
-                 = 네트워크/처리 지연
-        """
-        return (event.local_timestamp - event.timestamp) / 1000.0
-    
-    
-    def _update_lateness_stats(self, event_type: str, lateness_ms: float, dropped: bool):
-        """이벤트 타입별 lateness 통계 업데이트"""
-        if event_type not in self.lateness_stats:
-            return
-        
-        stats = self.lateness_stats[event_type]
-        stats['count'] += 1
-        stats['sum_ms'] += lateness_ms
-        if lateness_ms > stats['max_ms']:
-            stats['max_ms'] = lateness_ms
-        if dropped:
-            stats['dropped'] += 1
-    
-    
-    def _is_stale_event(self, event: Event, event_type: str) -> bool:
-        """
-        이벤트가 stale한지 판단
-        
-        Returns:
-            True: lateness > threshold → 버려야 함
-            False: 정상 → 적용해야 함
-        """
-        lateness_ms = self._calculate_lateness_ms(event)
-        is_stale = lateness_ms > self.max_event_lateness_ms
-        
-        # 통계 업데이트
-        self._update_lateness_stats(event_type, lateness_ms, is_stale)
-        
-        return is_stale
 
 
     def add_event(self, event: Event):
         """이벤트를 버퍼에 추가"""
         if self.start_time is None:
             self.start_time = time.time()
-            
-        self.stats['events_received'] += 1
 
-        # Snapshot은 별도 버퍼로 (lateness 체크 안 함 - snapshot은 항상 필요)
+        # Snapshot은 별도 버퍼
         if event.event_type == EventType.ORDERBOOK and event.data.get('is_snapshot', False):
             self.snapshot_buffer.append(event)
-            self.stats['snapshots_received'] += 1
             return
         
-        # 나머지는 메인 버퍼로
         self.main_buffer.append(event)
 
-        # Ticker가 오면 즉시 처리
+        # Ticker가 오면 처리
         if event.event_type == EventType.TICKER:
             self.last_ticker_ts = event.timestamp
             self.process_buffer()
 
     
     def process_buffer(self):
-        """버퍼의 이벤트들을 처리 (Watermark 기반)"""
+        """버퍼 처리"""
         if not self.main_buffer:
             return
         
-        # Watermark 계산
         if self.last_ticker_ts:
             watermark = self.last_ticker_ts
         else:
@@ -208,20 +252,19 @@ class StreamProcessor:
 
         self.last_watermark = watermark
 
-        # Watermark 이하의 이벤트만 처리
         to_process = [e for e in self.main_buffer if e.timestamp <= watermark]
         self.main_buffer = [e for e in self.main_buffer if e.timestamp > watermark]
 
-        # 시간순 정렬
         to_process.sort(key=lambda e: e.timestamp)
 
-        # 처리
         for event in to_process:
             self._dispatch_event(event)
 
 
     def _dispatch_event(self, event: Event):
-        """이벤트 타입별로 처리 분기"""
+        """이벤트 분기"""
+        self.stats['events_processed'] += 1
+        
         if event.event_type == EventType.ORDERBOOK:
             self._process_orderbook(event)
         elif event.event_type == EventType.TRADE:
@@ -231,35 +274,35 @@ class StreamProcessor:
         elif event.event_type == EventType.LIQUIDATION:
             self._process_liquidation(event)
 
-        self.stats['events_processed'] += 1
+
+    def _calculate_lateness_ms(self, event: Event) -> float:
+        """Lateness 계산 (ms)"""
+        lateness = (event.local_timestamp - event.timestamp) / 1000.0
+        return max(0.0, lateness)
 
 
     def _process_orderbook(self, event: Event):
         """
         Orderbook 업데이트 처리
         
-        Stale 이벤트는 버리고, 신선한 이벤트만 Effective Orderbook에 반영
+        중요: 모든 이벤트 적용 (drop 없음)
+              Lateness는 Freshness Uncertainty로만 측정
         """
-        # 초기화 체크
+        # 초기화
         if not self.initialized:
             snapshot = self._get_latest_snapshot(before_timestamp=event.timestamp)
             if snapshot:
                 self.current_orderbook = self._rebuild_orderbook_from_snapshot(snapshot)
                 self.initialized = True
+                self._log_init()
             else:
                 return
         
-        # Lateness 체크 - stale 이벤트는 버림
-        if self._is_stale_event(event, 'orderbook'):
-            self.stats['events_dropped'] += 1
-            self.stats['orderbook_dropped'] += 1
-            return  # Effective Orderbook에 반영하지 않음
-            
-        # Prev 상태 저장
-        if self.current_orderbook:
-            self.prev_orderbook = self.current_orderbook.clone(event.timestamp)
-
-        # Effective Orderbook에 업데이트 적용
+        # Lateness 측정 (Freshness Uncertainty용)
+        lateness_ms = self._calculate_lateness_ms(event)
+        self.ob_latency_window.add(lateness_ms)
+        
+        # Orderbook 업데이트 (모든 이벤트 적용)
         data = event.data
         price = float(data['price'])
         amount = float(data['amount'])
@@ -279,13 +322,13 @@ class StreamProcessor:
         self.current_orderbook.timestamp = event.timestamp
         self.stats['orderbook_updates'] += 1
         
-        # 주기적으로 Orderbook 크기 제한 (1000번마다)
+        # Orderbook trimming
         if self.stats['orderbook_updates'] % 1000 == 0:
             self._trim_orderbook()
 
 
     def _trim_orderbook(self):
-        """Orderbook 크기 제한 - best price 기준 상위 N개만 유지"""
+        """Orderbook 크기 제한"""
         if not self.current_orderbook:
             return
         
@@ -293,49 +336,48 @@ class StreamProcessor:
         bids = self.current_orderbook.bid_levels
         asks = self.current_orderbook.ask_levels
         
-        # Bid: 높은 가격 순으로 상위 N개만 유지
         if len(bids) > max_levels:
             sorted_prices = sorted(bids.keys(), reverse=True)[:max_levels]
             self.current_orderbook.bid_levels = {p: bids[p] for p in sorted_prices}
         
-        # Ask: 낮은 가격 순으로 상위 N개만 유지
         if len(asks) > max_levels:
             sorted_prices = sorted(asks.keys())[:max_levels]
             self.current_orderbook.ask_levels = {p: asks[p] for p in sorted_prices}
 
-    
+
     def _process_trade(self, event: Event):
         """
-        Trade 처리 및 검증
+        Trade 처리
         
-        Stale trade는 버림
+        Trade Validity 검증:
+        "이 trade는 현재 Orderbook 상태에서 발생 가능한 trade인가?"
         """
         if not self.initialized:
             return
         
-        # Lateness 체크 - stale trade는 버림
-        if self._is_stale_event(event, 'trade'):
-            self.stats['events_dropped'] += 1
-            self.stats['trades_dropped'] += 1
-            return
-        
         self.stats['trades_processed'] += 1
         
-        # Trade validation (Effective Orderbook 기준)
-        action = self._validate_trade(event)
+        # Lateness 측정
+        lateness_ms = self._calculate_lateness_ms(event)
+        self.trade_latency_window.add(lateness_ms)
         
-        if action == RepairAction.ACCEPT:
-            self.stats['trade_accepts'] += 1
-        elif action == RepairAction.QUARANTINE:
-            self.stats['trade_quarantines'] += 1
+        # Trade Validity 검증
+        is_valid = self._validate_trade(event, lateness_ms)
+        
+        if is_valid:
+            self.stats['trades_valid'] += 1
+        else:
+            self.stats['trades_invalid'] += 1
 
 
-    def _validate_trade(self, event: Event) -> RepairAction:
+    def _validate_trade(self, event: Event, lateness_ms: float) -> bool:
         """
-        Trade 검증 (Effective Orderbook 기준)
+        Trade Validity 검증
+        
+        Latency-aware margin: latency가 클수록 margin 증가
         """
         if not self.current_orderbook:
-            return RepairAction.QUARANTINE
+            return False
         
         price = float(event.data['price'])
         
@@ -343,139 +385,269 @@ class StreamProcessor:
         best_ask = self.current_orderbook.get_best_ask()
         
         if best_bid is None or best_ask is None:
-            return RepairAction.QUARANTINE
+            return False
+        
+        # Crossed market이면 invalid
+        if best_bid >= best_ask:
+            return False
         
         spread = best_ask - best_bid
         mid_price = (best_bid + best_ask) / 2
         
-        # 상대값과 절대값 중 큰 것 사용
+        # Base margin
         relative_margin = spread * 0.5
         absolute_margin = mid_price * 0.0001  # 1bp
-        margin = max(relative_margin, absolute_margin)
+        base_margin = max(relative_margin, absolute_margin)
         
-        # 범위 체크
-        if price < best_bid - margin:
-            return RepairAction.QUARANTINE
-        if price > best_ask + margin:
-            return RepairAction.QUARANTINE
+        # Latency-aware margin: 10ms당 1bp 추가
+        latency_margin = mid_price * 0.0001 * (lateness_ms / 10.0)
         
-        return RepairAction.ACCEPT
+        margin = base_margin + latency_margin
+        
+        return (best_bid - margin) <= price <= (best_ask + margin)
 
 
     def _process_ticker(self, event: Event):
         """
-        Ticker 이벤트 처리
+        Ticker 처리 - Uncertainty Vector 및 System State 계산
         
-        Ticker는 버리지 않고, lateness만 기록
-        (Ticker가 consistency check 트리거이므로)
+        Ticker는 "checkpoint" 역할
+        이 시점에서 Effective Orderbook의 Uncertainty를 평가하고
+        3-State를 결정함
         """
-        # Lateness 통계만 기록 (버리지 않음)
-        lateness_ms = self._calculate_lateness_ms(event)
-        self._update_lateness_stats('ticker', lateness_ms, dropped=False)
+        if not self.initialized:
+            self.stats['ticker_checkpoints'] += 1
+            return
         
         self.stats['ticker_checkpoints'] += 1
         
-        # 이전 상태 저장
-        prev_state = self.data_trust_state
+        # 이전 상태 저장 (전이 감지용)
+        prev_system_state = SystemState(
+            data_trust=self.current_system_state.data_trust,
+            hypothesis=self.current_system_state.hypothesis,
+            timestamp=self.current_system_state.timestamp
+        )
         
-        # Effective Orderbook에 대해 Consistency check
-        report = self.consistency_checker.check_all(
+        # 1. Freshness Uncertainty 계산
+        freshness = FreshnessUncertainty(
+            avg_lateness_ms=self.ob_latency_window.get_avg(),
+            max_lateness_ms=self.ob_latency_window.get_max(),
+            stale_event_ratio=self.ob_latency_window.get_stale_ratio()
+        )
+        
+        # 2. Integrity Uncertainty 계산
+        integrity = self.consistency_checker.check_integrity(
             ticker_data=event.data,
             orderbook=self.current_orderbook
         )
+        self.integrity_results.append(integrity)
         
-        # Check 통계 업데이트
-        for check_name, result in report.checks.items():
-            if check_name in self.check_stats['passes']:
-                if result == CheckResult.PASS:
-                    self.check_stats['passes'][check_name] += 1
-                elif result == CheckResult.FAIL:
-                    self.check_stats['failures'][check_name] += 1
+        # Failure rate 계산
+        if self.integrity_results:
+            integrity.spread_valid_failure_rate = sum(
+                1 for i in self.integrity_results if not i.spread_valid
+            ) / len(self.integrity_results)
+            integrity.price_in_spread_failure_rate = sum(
+                1 for i in self.integrity_results if not i.price_in_spread
+            ) / len(self.integrity_results)
+            integrity.funding_aligned_failure_rate = sum(
+                1 for i in self.integrity_results if not i.funding_imbalance_aligned
+            ) / len(self.integrity_results)
         
-        # Drop rate 기반 추가 판단
-        ob_drop_rate = self._get_recent_drop_rate()
+        # 3. Stability Uncertainty 계산
+        stability = self._calculate_stability(event.timestamp)
         
-        # State 결정 로직
-        # 1. Drop rate가 높으면 데이터 품질 문제 → 강등
-        # 2. Consistency check 결과로 최종 판단
+        # Spread history 업데이트
+        spread_bps = None
+        if self.current_orderbook:
+            best_bid = self.current_orderbook.get_best_bid()
+            best_ask = self.current_orderbook.get_best_ask()
+            if best_bid and best_ask and best_bid < best_ask:
+                spread = best_ask - best_bid
+                mid_price = (best_bid + best_ask) / 2
+                spread_bps = (spread / mid_price) * 10000  # basis points
+                bid_depth = sum(self.current_orderbook.bid_levels.values())
+                ask_depth = sum(self.current_orderbook.ask_levels.values())
+                total = bid_depth + ask_depth
+                imbalance = (bid_depth - ask_depth) / total if total > 0 else 0
+                self.spread_history.add(spread, imbalance, mid_price)
         
-        if ob_drop_rate > 0.1:  # 10% 이상 drop
-            # 데이터 품질 심각 → UNTRUSTED
-            self.data_trust_state = DataTrustState.UNTRUSTED
-        elif ob_drop_rate > 0.01:  # 1% 이상 drop
-            # 데이터 품질 저하 → 최대 DEGRADED
-            if report.all_passed:
-                self.data_trust_state = DataTrustState.DEGRADED
-            else:
-                self.data_trust_state = DataTrustState.UNTRUSTED
-        else:
-            # Drop rate 정상 → consistency check 결과로 판단
-            if report.all_passed:
-                self.data_trust_state = DataTrustState.TRUSTED
-            elif report.fail_count <= 1:
-                self.data_trust_state = DataTrustState.DEGRADED
-            else:
-                self.data_trust_state = DataTrustState.UNTRUSTED
+        # 4. Uncertainty Vector 업데이트
+        self.current_uncertainty = UncertaintyVector(
+            freshness=freshness,
+            integrity=integrity,
+            stability=stability,
+            timestamp=event.timestamp
+        )
         
-        # State 분포 업데이트
-        self.state_counts[self.data_trust_state.value] += 1
+        # 5. === NEW: 3-State 평가 ===
+        self.current_system_state = self.state_evaluator.evaluate(
+            uncertainty=self.current_uncertainty,
+            orderbook_spread_bps=spread_bps
+        )
         
-        # State 전이 기록 (변경되었을 때만)
-        if prev_state != self.data_trust_state:
-            failed_checks = [k for k, v in report.checks.items() if v == CheckResult.FAIL]
-            self.state_transitions.append({
-                'timestamp': event.timestamp,
-                'from_state': prev_state.value,
-                'to_state': self.data_trust_state.value,
-                'failed_checks': failed_checks,
-                'fail_count': report.fail_count,
-                'ob_drop_rate': ob_drop_rate
-            })
+        # Decision 분포 업데이트
+        decision = self.current_system_state.decision
+        self.decision_counts[decision.value] += 1
         
-        # 로그 (100개마다)
-        if self.stats['ticker_checkpoints'] % 100 == 0:
-            failed = [k for k, v in report.checks.items() if v == CheckResult.FAIL]
-            print(f"Ticker #{self.stats['ticker_checkpoints']}: "
-                  f"{self.data_trust_state.value}, failed={failed}, "
-                  f"drop_rate={ob_drop_rate:.2%}")
+        # 기존 Tradability 매핑 (호환성)
+        tradability = self._map_decision_to_tradability(decision)
+        self.tradability_counts[tradability] += 1
+        
+        # 6. State 전이 로깅
+        if self._has_system_state_changed(prev_system_state, self.current_system_state):
+            transition_record = self._create_transition_record(
+                prev_system_state, 
+                self.current_system_state,
+                event.timestamp
+            )
+            self.state_transitions.append(transition_record)
+        
+        # 7. Decision 로깅 (판단 중단 시 상세 기록)
+        if decision == DecisionPermissionState.HALTED:
+            self._log_decision(event.timestamp, "HALT", self.current_system_state)
+        elif decision == DecisionPermissionState.RESTRICTED:
+            self._log_decision(event.timestamp, "RESTRICT", self.current_system_state)
+        
+        # 8. 주기적 로깅
+        if self.stats['ticker_checkpoints'] % self.log_interval == 0:
+            self.uncertainty_log.append(self._create_full_log_entry())
+            self._print_status()
 
-    
-    def _get_recent_drop_rate(self) -> float:
-        """
-        Orderbook 이벤트 drop rate 계산
-        
-        Returns:
-            dropped / (processed + dropped)
-        """
-        processed = self.stats['orderbook_updates']
-        dropped = self.stats['orderbook_dropped']
-        total = processed + dropped
-        
-        if total == 0:
-            return 0.0
-        
-        return dropped / total
 
+    def _map_decision_to_tradability(self, decision: DecisionPermissionState) -> str:
+        """Decision Permission을 기존 Tradability로 매핑 (호환성)"""
+        mapping = {
+            DecisionPermissionState.ALLOWED: 'TRADABLE',
+            DecisionPermissionState.RESTRICTED: 'RESTRICTED',
+            DecisionPermissionState.HALTED: 'NOT_TRADABLE'
+        }
+        return mapping[decision]
+
+
+    def _has_system_state_changed(self, prev: SystemState, curr: SystemState) -> bool:
+        """System State 전이 감지"""
+        return (prev.data_trust != curr.data_trust or 
+                prev.hypothesis != curr.hypothesis)
+
+
+    def _create_transition_record(self, 
+                                   prev: SystemState, 
+                                   curr: SystemState,
+                                   timestamp: int) -> Dict:
+        """state_transitions.jsonl 형식의 전이 기록 생성"""
+        return {
+            'ts': timestamp,
+            'data_trust': curr.data_trust.value,
+            'hypothesis': curr.hypothesis.value,
+            'decision': curr.decision.value,
+            'trigger': {
+                'from_trust': prev.data_trust.value,
+                'from_hypothesis': prev.hypothesis.value,
+                'trust_reasons': curr.trust_reasons,
+                'hypothesis_reasons': curr.hypothesis_reasons
+            }
+        }
+
+
+    def _log_decision(self, timestamp: int, action: str, state: SystemState):
+        """decisions.jsonl 형식의 판단 기록 생성"""
+        # duration 계산 (다음 상태 변경까지의 시간은 나중에 계산)
+        decision_record = {
+            'ts': timestamp,
+            'action': action,
+            'reason': {
+                'data_trust': state.data_trust.value,
+                'hypothesis': state.hypothesis.value,
+                'trust_reasons': state.trust_reasons,
+                'hypothesis_reasons': state.hypothesis_reasons
+            },
+            'duration_ms': None  # 추후 계산
+        }
+        self.decisions_log.append(decision_record)
+
+
+    def _create_full_log_entry(self) -> Dict:
+        """전체 상태 로그 엔트리 생성"""
+        u = self.current_uncertainty
+        s = self.current_system_state
         
+        return {
+            'timestamp': u.timestamp,
+            # 3-State
+            'data_trust': s.data_trust.value,
+            'hypothesis': s.hypothesis.value,
+            'decision': s.decision.value,
+            # Uncertainty details
+            'freshness': {
+                'avg_lateness_ms': round(u.freshness.avg_lateness_ms, 2),
+                'max_lateness_ms': round(u.freshness.max_lateness_ms, 2),
+                'stale_ratio': round(u.freshness.stale_event_ratio, 4),
+            },
+            'integrity': {
+                'spread_valid': u.integrity.spread_valid,
+                'price_in_spread': u.integrity.price_in_spread,
+                'funding_aligned': u.integrity.funding_imbalance_aligned,
+                'failure_count': u.integrity.failure_count,
+            },
+            'stability': {
+                'spread_volatility': round(u.stability.spread_volatility, 4),
+                'time_since_liq_ms': u.stability.time_since_liquidation_ms,
+                'post_liq_stable': u.stability.post_liquidation_stable,
+            }
+        }
+
+
+    def _calculate_stability(self, current_ts: int) -> StabilityUncertainty:
+        """Stability Uncertainty 계산"""
+        stability = StabilityUncertainty()
+        
+        # Spread/Imbalance 변동성
+        stability.spread_volatility = self.spread_history.get_spread_volatility()
+        stability.imbalance_volatility = self.spread_history.get_imbalance_volatility()
+        stability.mid_price_volatility = self.spread_history.get_mid_price_volatility()
+        
+        # Liquidation 이후 시간
+        if self.last_liquidation_ts is not None:
+            time_since_liq = (current_ts - self.last_liquidation_ts) / 1000.0  # ms
+            stability.time_since_liquidation_ms = time_since_liq
+            stability.liquidation_size = self.last_liquidation_size
+            
+            # 충분한 시간이 지났는지 판단
+            stability.post_liquidation_stable = time_since_liq >= self.liquidation_cooldown_ms
+        
+        return stability
+
+
     def _process_liquidation(self, event: Event):
-        """Liquidation 이벤트 처리 (미래 구현)"""
-        pass
+        """
+        Liquidation 처리
+        
+        Liquidation은 Orderbook uncertainty의 spike로 정의
+        """
+        self.stats['liquidations_processed'] += 1
+        
+        # Liquidation 정보 기록
+        self.last_liquidation_ts = event.timestamp
+        self.last_liquidation_size = float(event.data.get('quantity', 0))
+        
+        # 로깅
+        print(f"  [LIQUIDATION] ts={event.timestamp}, "
+              f"side={event.data.get('side')}, "
+              f"size={self.last_liquidation_size:.4f}")
 
 
     def _get_latest_snapshot(self, before_timestamp: int) -> Optional[Event]:
-        """지정된 timestamp 이전의 가장 최근 snapshot"""
-        valid_snapshots = [
-            s for s in self.snapshot_buffer if s.timestamp <= before_timestamp
-        ]
+        """Snapshot 가져오기"""
+        valid_snapshots = [s for s in self.snapshot_buffer if s.timestamp <= before_timestamp]
         if not valid_snapshots:
             return None
         return max(valid_snapshots, key=lambda s: s.timestamp)
     
 
     def _rebuild_orderbook_from_snapshot(self, snapshot: Event) -> OrderbookState:
-        """Snapshot으로부터 Orderbook 상태 재구성"""
+        """Snapshot으로 Orderbook 재구성"""
         self.stats['snapshots_used'] += 1
-        self.initialized = True
         
         data = snapshot.data
         
@@ -485,68 +657,80 @@ class StreamProcessor:
         else:
             bids = {}
             asks = {}
-            if data.get('side') == 'bid':
-                bids[float(data['price'])] = float(data['amount'])
-            else:
-                asks[float(data['price'])] = float(data['amount'])
         
         return OrderbookState(
             timestamp=snapshot.timestamp,
             bid_levels=bids,
             ask_levels=asks
         )
-    
 
-    def get_result(self) -> ProcessingResult:
+
+    def _log_init(self):
+        """초기화 로깅"""
+        print(f"\n  [INIT] Effective Orderbook initialized")
+        print(f"         Bids: {len(self.current_orderbook.bid_levels)}")
+        print(f"         Asks: {len(self.current_orderbook.ask_levels)}")
+        best_bid = self.current_orderbook.get_best_bid()
+        best_ask = self.current_orderbook.get_best_ask()
+        print(f"         Best Bid: {best_bid}")
+        print(f"         Best Ask: {best_ask}")
+        if best_bid and best_ask:
+            print(f"         Spread: {best_ask - best_bid:.2f}")
+
+
+    def _print_status(self):
+        """상태 출력 (3-State 버전)"""
+        u = self.current_uncertainty
+        s = self.current_system_state
+        
+        print(f"\n{'='*60}")
+        print(f"Ticker #{self.stats['ticker_checkpoints']}")
+        print(f"{'='*60}")
+        print(f"  [3-State]")
+        print(f"    Data Trust:  {s.data_trust.value}")
+        print(f"    Hypothesis:  {s.hypothesis.value}")
+        print(f"    Decision:    {s.decision.value}")
+        print(f"  [Uncertainty]")
+        print(f"    Freshness: avg={u.freshness.avg_lateness_ms:.1f}ms, "
+              f"stale_ratio={u.freshness.stale_event_ratio:.2%}")
+        print(f"    Integrity: spread_valid={u.integrity.spread_valid}, "
+              f"failures={u.integrity.failure_count}")
+        print(f"    Stability: spread_vol={u.stability.spread_volatility:.4f}, "
+              f"post_liq_stable={u.stability.post_liquidation_stable}")
+
+
+    def get_result(self) -> 'ProcessingResult':
         """처리 결과 반환"""
         processing_time = time.time() - self.start_time if self.start_time else 0
         
-        # 평균 lateness 계산 (이벤트 타입별)
-        avg_lateness = {}
-        for event_type, stats in self.lateness_stats.items():
-            if stats['count'] > 0:
-                avg_lateness[event_type] = stats['sum_ms'] / stats['count']
-            else:
-                avg_lateness[event_type] = 0.0
+        # Decision duration 계산 (연속된 HALT/RESTRICT의 지속 시간)
+        self._calculate_decision_durations()
         
         result = ProcessingResult(
             dataset_name=self.dataset_name,
             processing_time_sec=processing_time,
-            total_events=self.stats['events_processed'],
-            total_trades=self.stats['trades_processed'],
-            total_tickers=self.stats['ticker_checkpoints'],
-            total_orderbook_updates=self.stats['orderbook_updates'],
-            total_snapshots=self.stats['snapshots_used'],
-            trade_accepts=self.stats['trade_accepts'],
-            trade_quarantines=self.stats['trade_quarantines'],
-            events_dropped=self.stats['events_dropped'],
-            orderbook_dropped=self.stats['orderbook_dropped'],
-            trades_dropped=self.stats['trades_dropped'],
-            check_failures=self.check_stats['failures'].copy(),
-            check_passes=self.check_stats['passes'].copy(),
-            state_counts=self.state_counts.copy(),
+            stats=self.stats.copy(),
+            tradability_counts=self.tradability_counts.copy(),
             state_transitions=self.state_transitions.copy(),
-            lateness_stats=self.lateness_stats.copy(),
-            avg_lateness_by_type=avg_lateness
+            uncertainty_log=self.uncertainty_log.copy(),
+            final_uncertainty=self._create_full_log_entry() if self.current_uncertainty else {}
         )
         
+        # 추가 데이터 (3-State 관련)
+        result.decision_counts = self.decision_counts.copy()
+        result.decisions_log = self.decisions_log.copy()
+        result.state_evaluator_summary = self.state_evaluator.get_state_summary()
+        
         return result
-    
 
-    def print_status(self):
-        """현재 상태 출력"""
-        print(f"\n{'='*60}")
-        print(f"📊 StreamProcessor Status")
-        print(f"{'='*60}")
-        print(f"  Dataset: {self.dataset_name}")
-        print(f"  Data Trust State: {self.data_trust_state.value}")
-        print(f"  Initialized: {self.initialized}")
-        print(f"\n  Lateness Config:")
-        print(f"    Max Event Lateness: {self.max_event_lateness_ms}ms")
-        print(f"\n  Drop Statistics:")
-        print(f"    Orderbook dropped: {self.stats['orderbook_dropped']:,}")
-        print(f"    Trades dropped: {self.stats['trades_dropped']:,}")
-        print(f"    Drop rate: {self._get_recent_drop_rate():.2%}")
-        print(f"\n  Statistics:")
-        for key, value in self.stats.items():
-            print(f"    {key}: {value:,}")
+
+    def _calculate_decision_durations(self):
+        """Decision 로그의 duration 계산"""
+        for i, decision in enumerate(self.decisions_log):
+            if i + 1 < len(self.decisions_log):
+                next_ts = self.decisions_log[i + 1]['ts']
+                decision['duration_ms'] = (next_ts - decision['ts']) / 1000.0
+            else:
+                # 마지막 decision은 현재까지의 duration
+                if self.current_uncertainty:
+                    decision['duration_ms'] = (self.current_uncertainty.timestamp - decision['ts']) / 1000.0
