@@ -1,13 +1,20 @@
 """
-실시간 스트림 처리 엔진
+실시간 스트림 처리 엔진 (Simple Version)
+
+수정 사항:
+- Tolerance 파라미터 제거
+- ProcessingResult와 연동
+- Trade validation 단순화
 """
+import time
 from collections import deque
 from typing import List, Optional, Dict, Deque
+
 from src.enums import EventType, DataTrustState, RepairAction
 from src.data_types import Event, OrderbookState
 from src.consistency import ConsistencyChecker, CheckResult, ConsistencyReport
 from src.orderbook import OrderbookMetrics
-from src.config import DEFAULT_PROCESSOR_CONFIG, DEFAULT_CONSISTENCY_CONFIG
+from src.results import ProcessingResult
 
 
 class StreamProcessor:
@@ -17,23 +24,18 @@ class StreamProcessor:
                  buffer_size: int = 1000,
                  watermark_delay_ms: int = 50,
                  snapshot_buffer_size: int = 5,
-                 processor_config = None,
-                 consistency_config = None):
+                 dataset_name: str = ""):
         """
         Args:
             buffer_size: 메인 버퍼 크기
             watermark_delay_ms: Watermark 지연 시간 (ms)
             snapshot_buffer_size: Snapshot 버퍼 크기
-            processor_config: StreamProcessorConfig 인스턴스
-            consistency_config: ConsistencyConfig 인스턴스
+            dataset_name: 데이터셋 이름 (결과 식별용)
         """
         self.buffer_size = buffer_size
         self.watermark_delay_ms = watermark_delay_ms
         self.snapshot_buffer_size = snapshot_buffer_size
-
-        # Config
-        self.processor_config = processor_config or DEFAULT_PROCESSOR_CONFIG
-        self.consistency_config = consistency_config or DEFAULT_CONSISTENCY_CONFIG
+        self.dataset_name = dataset_name
 
         # Buffers
         self.main_buffer: List[Event] = []
@@ -45,7 +47,7 @@ class StreamProcessor:
 
         # System state
         self.data_trust_state = DataTrustState.UNTRUSTED
-        self.initialized = False   # Snapshot을 받았는지
+        self.initialized = False
 
         # Statistics
         self.stats = {
@@ -54,33 +56,62 @@ class StreamProcessor:
             'trades_processed': 0,
             'orderbook_updates': 0,
             'ticker_checkpoints': 0,
+            'snapshots_received': 0,
             'snapshots_used': 0,
-            'repairs': 0,
-            'quarantines': 0,
-            'accepts': 0,
+            'trade_accepts': 0,
+            'trade_quarantines': 0,
         }
+        
+        # Consistency Check 통계
+        self.check_stats = {
+            'passes': {
+                'orderbook_exists': 0,
+                'spread_valid': 0,
+                'price_in_spread': 0,
+                'depth_balanced': 0,
+                'funding_imbalance_aligned': 0
+            },
+            'failures': {
+                'orderbook_exists': 0,
+                'spread_valid': 0,
+                'price_in_spread': 0,
+                'depth_balanced': 0,
+                'funding_imbalance_aligned': 0
+            }
+        }
+        
+        # State 분포
+        self.state_counts = {
+            'TRUSTED': 0,
+            'DEGRADED': 0,
+            'UNTRUSTED': 0
+        }
+        
+        # State 전이 기록
+        self.state_transitions: List[Dict] = []
 
         # Consistency Checker
         self.consistency_checker = ConsistencyChecker()
 
-        # last watermark
+        # Watermark
         self.last_watermark = None
         self.last_ticker_ts = None
+        
+        # 처리 시작 시간
+        self.start_time = None
 
 
     def add_event(self, event: Event):
-        """
-        이벤트를 버퍼에 추가
-
-        Args:
-            event: Event 인스턴스
-        """
+        """이벤트를 버퍼에 추가"""
+        if self.start_time is None:
+            self.start_time = time.time()
+            
         self.stats['events_received'] += 1
 
         # Snapshot은 별도 버퍼로
         if event.event_type == EventType.ORDERBOOK and event.data.get('is_snapshot', False):
             self.snapshot_buffer.append(event)
-            print(f"📸 Snapshot 수신: ts={event.timestamp}, buffer size={len(self.snapshot_buffer)}/{self.snapshot_buffer_size}")
+            self.stats['snapshots_received'] += 1
             return
         
         # 나머지는 메인 버퍼로
@@ -102,7 +133,7 @@ class StreamProcessor:
             watermark = self.last_ticker_ts
         else:
             last_event_ts = max(e.timestamp for e in self.main_buffer)
-            watermark = last_event_ts - (self.watermark_delay_ms * 1000)    # ms -> us
+            watermark = last_event_ts - (self.watermark_delay_ms * 1000)
 
         self.last_watermark = watermark
 
@@ -131,6 +162,7 @@ class StreamProcessor:
 
         self.stats['events_processed'] += 1
 
+
     def _process_orderbook(self, event: Event):
         """Orderbook 업데이트 처리"""
         
@@ -140,7 +172,6 @@ class StreamProcessor:
                 self.current_orderbook = self._rebuild_orderbook_from_snapshot(snapshot)
                 self.initialized = True
             else:
-                # Snapshot이 없으면 처리 불가
                 return
             
         # Prev 상태 저장
@@ -155,16 +186,13 @@ class StreamProcessor:
 
         if side == 'bid':
             if amount == 0:
-                # 삭제
                 self.current_orderbook.bid_levels.pop(price, None)
             else:
                 self.current_orderbook.bid_levels[price] = amount
         else:
             if amount == 0:
-                # 삭제
                 self.current_orderbook.ask_levels.pop(price, None)
             else:
-                # 추가/업데이트
                 self.current_orderbook.ask_levels[price] = amount
         
         self.current_orderbook.timestamp = event.timestamp
@@ -172,100 +200,30 @@ class StreamProcessor:
 
     
     def _process_trade(self, event: Event):
-        """Trade 처리 및 검증"""
-        # 초기화되지 않았으면 무시
+        """Trade 처리 및 검증 (단순화)"""
         if not self.initialized:
             return
         
         self.stats['trades_processed'] += 1
         
-        # ⭐ 같은 timestamp의 orderbook update로 인한 trade인지 확인
-        if self._is_orderbook_induced_trade(event):
-            # Orderbook 업데이트가 유발한 trade (skip validation)
-            self.stats['accepts'] += 1
-            return
-        
         # Trade validation
         action = self._validate_trade(event)
         
         if action == RepairAction.ACCEPT:
-            self.stats['accepts'] += 1
-        elif action == RepairAction.REPAIR:
-            self.stats['repairs'] += 1
+            self.stats['trade_accepts'] += 1
         elif action == RepairAction.QUARANTINE:
-            self.stats['quarantines'] += 1
-
-
-    def _is_orderbook_induced_trade(self, event: Event) -> bool:
-        """
-        Orderbook 업데이트가 직접 유발한 trade인지 확인
-        
-        조건:
-        1. Timestamp가 정확히 같음
-        2. Price가 일치
-        3. Amount가 유사 (1% tolerance)
-        4. Side가 매칭 (trade의 buy -> orderbook의 ask)
-        
-        Args:
-            event: Trade Event
-            
-        Returns:
-            True if orderbook-induced trade
-        """
-        if not self.current_orderbook:
-            return False
-        
-        # 1. Timestamp 체크
-        if self.current_orderbook.timestamp != event.timestamp:
-            return False
-        
-        data = event.data
-        trade_price = float(data['price'])
-        trade_amount = float(data['amount'])
-        trade_side = data['side']  # 'buy' or 'sell'
-        
-        # 2. Trade가 소진한 orderbook side 결정
-        # Buy trade -> Ask orderbook을 소진
-        # Sell trade -> Bid orderbook을 소진
-        orderbook_side = 'ask' if trade_side == 'buy' else 'bid'
-        
-        # 3. 해당 price level이 현재 orderbook에 없는지 확인
-        # (방금 소진되었으므로 없어야 정상)
-        if orderbook_side == 'ask':
-            levels = self.current_orderbook.ask_levels
-        else:
-            levels = self.current_orderbook.bid_levels
-        
-        # Price level이 존재하면 이상함 (아직 안 소진됨)
-        if trade_price in levels:
-            return False
-        
-        # 4. Prev orderbook에는 있었는지 확인
-        if not self.prev_orderbook:
-            return False
-        
-        if orderbook_side == 'ask':
-            prev_levels = self.prev_orderbook.ask_levels
-        else:
-            prev_levels = self.prev_orderbook.bid_levels
-        
-        if trade_price not in prev_levels:
-            return False
-        
-        # 5. Amount 체크 (1% tolerance)
-        prev_amount = prev_levels[trade_price]
-        tolerance = self.consistency_config.trade_amount_tolerance
-        
-        if abs(prev_amount - trade_amount) / trade_amount <= tolerance:
-            # 완전히 소진됨 (orderbook-induced trade)
-            return True
-        
-        return False
+            self.stats['trade_quarantines'] += 1
 
 
     def _validate_trade(self, event: Event) -> RepairAction:
         """
-        심플한 검증: Trade price가 현재 orderbook 범위 내에 있는가?
+        Trade 검증 (단순화 버전)
+        
+        체크 항목:
+        1. Orderbook이 존재하는가?
+        2. Trade price가 현재 best bid/ask 범위 내에 있는가?
+        
+        Tolerance 없음 - 단순한 범위 체크만
         """
         if not self.current_orderbook:
             return RepairAction.QUARANTINE
@@ -279,29 +237,40 @@ class StreamProcessor:
         if best_bid is None or best_ask is None:
             return RepairAction.QUARANTINE
         
-        # Buy trade는 best_ask 근처에서 발생해야 함
-        # Sell trade는 best_bid 근처에서 발생해야 함
-        if side == 'buy':
-            # Trade price가 best_ask보다 너무 높으면 이상함
-            if price > best_ask * 1.001:  # 0.1% 허용
-                return RepairAction.QUARANTINE
-        else:
-            # Trade price가 best_bid보다 너무 낮으면 이상함
-            if price < best_bid * 0.999:
-                return RepairAction.QUARANTINE
+        # 단순한 범위 체크
+        # Buy trade: best_bid 이상, best_ask 이하에서 체결되어야 함
+        # Sell trade: best_bid 이상, best_ask 이하에서 체결되어야 함
+        # (약간의 여유: spread의 절반)
+        spread = best_ask - best_bid
+        margin = spread * 0.5  # spread의 절반만큼 여유
+        
+        if price < best_bid - margin:
+            return RepairAction.QUARANTINE
+        if price > best_ask + margin:
+            return RepairAction.QUARANTINE
         
         return RepairAction.ACCEPT
-        
+
 
     def _process_ticker(self, event: Event):
-        """Ticker 이벤트 처리 - 단순화된 버전"""
+        """Ticker 이벤트 처리"""
         self.stats['ticker_checkpoints'] += 1
+        
+        # 이전 상태 저장
+        prev_state = self.data_trust_state
         
         # Consistency check
         report = self.consistency_checker.check_all(
             ticker_data=event.data,
             orderbook=self.current_orderbook
         )
+        
+        # Check 통계 업데이트
+        for check_name, result in report.checks.items():
+            if result == CheckResult.PASS:
+                self.check_stats['passes'][check_name] += 1
+            elif result == CheckResult.FAIL:
+                self.check_stats['failures'][check_name] += 1
         
         # State 전환 - 단순한 규칙
         if report.all_passed:
@@ -311,11 +280,25 @@ class StreamProcessor:
         else:
             self.data_trust_state = DataTrustState.UNTRUSTED
         
-        # 간단한 로그
+        # State 분포 업데이트
+        self.state_counts[self.data_trust_state.value] += 1
+        
+        # State 전이 기록 (변경되었을 때만)
+        if prev_state != self.data_trust_state:
+            failed_checks = [k for k, v in report.checks.items() if v == CheckResult.FAIL]
+            self.state_transitions.append({
+                'timestamp': event.timestamp,
+                'from_state': prev_state.value,
+                'to_state': self.data_trust_state.value,
+                'failed_checks': failed_checks,
+                'fail_count': report.fail_count
+            })
+        
+        # 로그 (100개마다)
         if self.stats['ticker_checkpoints'] % 100 == 0:
             failed = [k for k, v in report.checks.items() if v == CheckResult.FAIL]
             print(f"Ticker #{self.stats['ticker_checkpoints']}: "
-                f"{self.data_trust_state.value}, failed={failed}")
+                  f"{self.data_trust_state.value}, failed={failed}")
 
         
     def _process_liquidation(self, event: Event):
@@ -324,49 +307,26 @@ class StreamProcessor:
 
 
     def _get_latest_snapshot(self, before_timestamp: int) -> Optional[Event]:
-        """
-        지정된 timestamp 이전의 가장 최근 snapshot 가져오기
-
-        Args:
-            before_timestamp: 이 시간 이전의 snapshot
-
-        Returns:
-            Event 또는 None
-        """
+        """지정된 timestamp 이전의 가장 최근 snapshot"""
         valid_snapshots = [
             s for s in self.snapshot_buffer if s.timestamp <= before_timestamp
         ]
-
         if not valid_snapshots:
             return None
-        
         return max(valid_snapshots, key=lambda s: s.timestamp)
     
 
     def _rebuild_orderbook_from_snapshot(self, snapshot: Event) -> OrderbookState:
-        """
-        Snapshot으로부터 Orderbook 상태 재구성
-        
-        Args:
-            snapshot: Snapshot Event
-            
-        Returns:
-            OrderbookState
-        """
+        """Snapshot으로부터 Orderbook 상태 재구성"""
         self.stats['snapshots_used'] += 1
         self.initialized = True
         
-        print(f"🔄 Snapshot으로 Orderbook 재구성 중...")
-        
         data = snapshot.data
         
-        # Snapshot 데이터 구조 확인
         if 'bids' in data and 'asks' in data:
-            # Grouped snapshot 형식
             bids = {float(price): float(amount) for price, amount in data['bids']}
             asks = {float(price): float(amount) for price, amount in data['asks']}
         else:
-            # Single row 형식 (이전 방식, 혹시 모를 대비)
             bids = {}
             asks = {}
             if data.get('side') == 'bid':
@@ -374,57 +334,42 @@ class StreamProcessor:
             else:
                 asks[float(data['price'])] = float(data['amount'])
         
-        orderbook = OrderbookState(
+        return OrderbookState(
             timestamp=snapshot.timestamp,
             bid_levels=bids,
             ask_levels=asks
         )
-        
-        print(f"📊 Orderbook 재구성: {len(bids)} bids, {len(asks)} asks")
-        
-        return orderbook
     
 
-    def _print_consistency_check(self, event: Event, result: Dict):
-        """Consistency check 결과 출력"""
-        consistency_score = result['overall_score']
+    def get_result(self) -> ProcessingResult:
+        """처리 결과 반환"""
+        processing_time = time.time() - self.start_time if self.start_time else 0
         
-        print(f"\n{'='*60}")
-        print(f"🔔 Ticker Checkpoint at {event.timestamp}")
-        print(f"{'='*60}")
-        print(f"  Data Trust State: {self.data_trust_state.value}")
-        print(f"  Consistency Score: {consistency_score:.2%}")
-        print(f"  Events Processed: {self.stats['events_processed']}")
-        print(f"  Repairs: {self.stats['repairs']}")
-        print(f"  Quarantines: {self.stats['quarantines']}")
+        result = ProcessingResult(
+            dataset_name=self.dataset_name,
+            processing_time_sec=processing_time,
+            total_events=self.stats['events_processed'],
+            total_trades=self.stats['trades_processed'],
+            total_tickers=self.stats['ticker_checkpoints'],
+            total_orderbook_updates=self.stats['orderbook_updates'],
+            total_snapshots=self.stats['snapshots_used'],
+            trade_accepts=self.stats['trade_accepts'],
+            trade_quarantines=self.stats['trade_quarantines'],
+            check_failures=self.check_stats['failures'].copy(),
+            check_passes=self.check_stats['passes'].copy(),
+            state_counts=self.state_counts.copy(),
+            state_transitions=self.state_transitions.copy()
+        )
         
-        if self.current_orderbook:
-            depth = OrderbookMetrics.calculate_depth(self.current_orderbook)
-            print(f"  OB Depth (bid/ask): {depth['bid_depth']:.4f} / {depth['ask_depth']:.4f}")
-        
-        # Detailed breakdown
-        print(f"\n{'='*60}")
-        print(f"🔍 Consistency Check Details")
-        print(f"{'='*60}")
-        
-        for key in ['price', 'spread', 'imbalance_funding', 'depth', 'system']:
-            if key in result:
-                score = result[key]['score']
-                emoji = "✅" if score >= 0.8 else "⚠️"
-                print(f"  {emoji} {key:20s}: {score:.2%}")
-                
-                # Price 세부사항
-                if key == 'price' and 'details' in result[key]:
-                    for detail_key, detail_score in result[key]['details'].items():
-                        print(f"      - {detail_key}: {detail_score:.2%}")
-        
-        print(f"\n  Overall Score: {consistency_score:.2%}")
+        return result
     
+
     def print_status(self):
         """현재 상태 출력"""
         print(f"\n{'='*60}")
         print(f"📊 StreamProcessor Status")
         print(f"{'='*60}")
+        print(f"  Dataset: {self.dataset_name}")
         print(f"  Data Trust State: {self.data_trust_state.value}")
         print(f"  Initialized: {self.initialized}")
         print(f"\n  Buffer Status:")
@@ -436,10 +381,5 @@ class StreamProcessor:
         
         if self.current_orderbook:
             print(f"\n  Current Orderbook:")
-            print(f"    Timestamp: {self.current_orderbook.timestamp}")
             print(f"    Bid Levels: {len(self.current_orderbook.bid_levels)}")
             print(f"    Ask Levels: {len(self.current_orderbook.ask_levels)}")
-            
-            depth = OrderbookMetrics.calculate_depth(self.current_orderbook)
-            print(f"    Bid Depth: {depth['bid_depth']:.4f} BTC")
-            print(f"    Ask Depth: {depth['ask_depth']:.4f} BTC")

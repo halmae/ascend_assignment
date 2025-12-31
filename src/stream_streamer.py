@@ -163,75 +163,75 @@ class DataFrameStreamer:
         Returns:
             Event 또는 None (더 이상 없으면)
         """
-        # 각 스트림의 다음 이벤트 timestamp 확인
-        candidates = []
-        
-        # 1. Snapshot group
-        if self.snapshot_group_idx < len(self.snapshot_groups):
-            snapshot_group = self.snapshot_groups[self.snapshot_group_idx]
-            candidates.append({
-                'type': 'snapshot',
-                'timestamp': snapshot_group['local_timestamp'],
-                'data': snapshot_group
-            })
-        
-        # 2. Orderbook update (snapshot 제외)
-        if self.orderbook_idx < len(self.orderbook):
-            row = self.orderbook.iloc[self.orderbook_idx]
+        while True:  # 재귀 대신 반복문 사용
+            candidates = []
             
-            # ⭐ Snapshot이 아닌 것만 (올바른 체크)
-            if row['is_snapshot'] != True:  # 또는 row['is_snapshot'] == False
+            # 1. Snapshot group
+            if self.snapshot_group_idx < len(self.snapshot_groups):
+                snapshot_group = self.snapshot_groups[self.snapshot_group_idx]
                 candidates.append({
-                    'type': 'orderbook',
+                    'type': 'snapshot',
+                    'timestamp': snapshot_group['local_timestamp'],
+                    'data': snapshot_group
+                })
+            
+            # 2. Orderbook update (snapshot 제외)
+            # Snapshot 행들을 먼저 건너뛰기
+            while self.orderbook_idx < len(self.orderbook):
+                row = self.orderbook.iloc[self.orderbook_idx]
+                if row['is_snapshot'] == True:
+                    self.orderbook_idx += 1
+                    continue
+                else:
+                    candidates.append({
+                        'type': 'orderbook',
+                        'timestamp': row['local_timestamp'],
+                        'data': row
+                    })
+                    break
+            
+            # 3. Trade
+            if self.trades_idx < len(self.trades):
+                row = self.trades.iloc[self.trades_idx]
+                candidates.append({
+                    'type': 'trade',
                     'timestamp': row['local_timestamp'],
                     'data': row
                 })
-            else:
-                # Snapshot 행이면 건너뛰기
+            
+            # 4. Ticker
+            if self.ticker_idx < len(self.ticker):
+                row = self.ticker.iloc[self.ticker_idx]
+                candidates.append({
+                    'type': 'ticker',
+                    'timestamp': row['local_timestamp'],
+                    'data': row
+                })
+            
+            # 후보가 없으면 종료
+            if not candidates:
+                return None
+            
+            # 가장 빠른 timestamp 선택
+            earliest = min(candidates, key=lambda x: x['timestamp'])
+            
+            # Event 생성 및 인덱스 증가
+            if earliest['type'] == 'snapshot':
+                event = self._create_snapshot_event(earliest['data'])
+                self.snapshot_group_idx += 1
+                return event
+            elif earliest['type'] == 'orderbook':
+                event = self._create_orderbook_event(earliest['data'])
                 self.orderbook_idx += 1
-                # 재귀 호출하여 다음 이벤트 가져오기
-                return self.get_next_event()
-        
-        # 3. Trade
-        if self.trades_idx < len(self.trades):
-            row = self.trades.iloc[self.trades_idx]
-            candidates.append({
-                'type': 'trade',
-                'timestamp': row['local_timestamp'],
-                'data': row
-            })
-        
-        # 4. Ticker
-        if self.ticker_idx < len(self.ticker):
-            row = self.ticker.iloc[self.ticker_idx]
-            candidates.append({
-                'type': 'ticker',
-                'timestamp': row['local_timestamp'],
-                'data': row
-            })
-        
-        # 후보가 없으면 종료
-        if not candidates:
-            return None
-        
-        # 가장 빠른 timestamp 선택
-        earliest = min(candidates, key=lambda x: x['timestamp'])
-        
-        # Event 생성 및 인덱스 증가
-        if earliest['type'] == 'snapshot':
-            event = self._create_snapshot_event(earliest['data'])
-            self.snapshot_group_idx += 1
-        elif earliest['type'] == 'orderbook':
-            event = self._create_orderbook_event(earliest['data'])
-            self.orderbook_idx += 1
-        elif earliest['type'] == 'trade':
-            event = self._create_trade_event(earliest['data'])
-            self.trades_idx += 1
-        elif earliest['type'] == 'ticker':
-            event = self._create_ticker_event(earliest['data'])
-            self.ticker_idx += 1
-        
-        return event
+                return event
+            elif earliest['type'] == 'trade':
+                event = self._create_trade_event(earliest['data'])
+                self.trades_idx += 1
+                return event
+            elif earliest['type'] == 'ticker':
+                event = self._create_ticker_event(earliest['data'])
+                self.ticker_idx += 1
+                return event
     
     def _create_snapshot_event(self, snapshot_group: Dict) -> Event:
         """Snapshot Event 생성"""
