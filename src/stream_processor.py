@@ -222,7 +222,7 @@ class StreamProcessor:
 
     
     def _process_trade(self, event: Event):
-        """Trade 처리 및 검증 (단순화)"""
+        """Trade 처리 및 검증"""
         if not self.initialized:
             return
         
@@ -239,11 +239,11 @@ class StreamProcessor:
 
     def _validate_trade(self, event: Event) -> RepairAction:
         """
-        Trade 검증 (단순화 버전)
+        Trade 검증 (수정된 버전)
         
-        체크 항목:
-        1. Orderbook이 존재하는가?
-        2. Trade price가 현재 best bid/ask 범위 내에 있는가?
+        변경사항:
+        - 상대값(spread 기반)과 절대값(1bp) 중 큰 margin 사용
+        - Spread가 좁아도 최소 1bp 여유 보장
         """
         if not self.current_orderbook:
             return RepairAction.QUARANTINE
@@ -256,10 +256,15 @@ class StreamProcessor:
         if best_bid is None or best_ask is None:
             return RepairAction.QUARANTINE
         
-        # 단순한 범위 체크
         spread = best_ask - best_bid
-        margin = spread * 0.5  # spread의 절반만큼 여유
+        mid_price = (best_bid + best_ask) / 2
         
+        # 수정: 상대값과 절대값 중 큰 것 사용
+        relative_margin = spread * 0.5
+        absolute_margin = mid_price * 0.0001  # 1bp (0.01%)
+        margin = max(relative_margin, absolute_margin)
+        
+        # 범위 체크
         if price < best_bid - margin:
             return RepairAction.QUARANTINE
         if price > best_ask + margin:

@@ -2,13 +2,10 @@
 Research vs Validation 비교 분석 실행 스크립트
 
 사용법:
-    python run_analysis.py --research /path/to/research --validation /path/to/validation
-    
-또는 Python에서:
-    from run_analysis import run_comparison
-    results = run_comparison(research_dir, validation_dir)
+    python run_analysis.py --research ./data/research --validation ./data/validation
 """
 import sys
+import gc
 import argparse
 from pathlib import Path
 
@@ -55,20 +52,19 @@ def process_dataset(data_dir: str, dataset_name: str) -> ProcessingResult:
             processor.add_event(event)
             event_count += 1
             
-            # 진행 상황 출력 (10000개마다)
-            if event_count % 10000 == 0:
+            # 진행 상황 출력 (100000개마다)
+            if event_count % 100000 == 0:
                 progress = streamer.get_progress()
                 ob_size = 0
                 if processor.current_orderbook:
                     ob_size = len(processor.current_orderbook.bid_levels) + len(processor.current_orderbook.ask_levels)
                 print(f"  Processed {event_count:,} events... "
-                      f"OB size: {ob_size:,}, "
-                      f"Buffer: {len(processor.main_buffer):,}")
+                      f"OB size: {ob_size:,}, Buffer: {len(processor.main_buffer):,}")
     
     # 남은 버퍼 처리
     processor.process_buffer()
     
-    # 5. 결과 반환
+    # 5. 결과 출력 및 반환
     result = processor.get_result()
     result.print_summary()
     
@@ -76,28 +72,22 @@ def process_dataset(data_dir: str, dataset_name: str) -> ProcessingResult:
     del streamer
     del processor
     del loader
-    import gc
     gc.collect()
-
+    
     return result
 
 
 def run_comparison(research_dir: str, validation_dir: str) -> dict:
     """
     Research와 Validation 데이터 비교 분석
-    (메모리 최적화 버전)
     """
-    import gc
-    
     # Research 처리
     research_result = process_dataset(research_dir, "Research")
-    
-    # 메모리 해제
-    gc.collect()
-    print("\n🧹 메모리 정리 완료\n")
+    print("\n🧹 Research 메모리 정리 완료\n")
     
     # Validation 처리
     validation_result = process_dataset(validation_dir, "Validation")
+    print("\n🧹 Validation 메모리 정리 완료\n")
     
     # 비교
     compare_results(research_result, validation_result)
@@ -111,13 +101,6 @@ def run_comparison(research_dir: str, validation_dir: str) -> dict:
 def run_single(data_dir: str, dataset_name: str = "Dataset") -> ProcessingResult:
     """
     단일 데이터셋만 처리
-    
-    Args:
-        data_dir: 데이터 디렉토리
-        dataset_name: 데이터셋 이름
-    
-    Returns:
-        ProcessingResult
     """
     return process_dataset(data_dir, dataset_name)
 
@@ -139,5 +122,5 @@ if __name__ == "__main__":
         results = run_comparison(args.research, args.validation)
     else:
         print("사용법:")
-        print("  단일 처리: python run_analysis.py --single /path/to/data --name MyDataset")
-        print("  비교 분석: python run_analysis.py --research /path/to/research --validation /path/to/validation")
+        print("  단일 처리: python run_analysis.py --single ./data/research --name Research")
+        print("  비교 분석: python run_analysis.py --research ./data/research --validation ./data/validation")
