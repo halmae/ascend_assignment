@@ -135,3 +135,175 @@ class ConsistencyChecker:
             'spread_bps': spread_bps,
             'category': category
         }
+    
+
+    def check_imbalance_vs_funding(self, ticker_data: Dict, orderbook: OrderbookState) -> Dict:
+        """
+        Imbalance vs Funding Rate 일관성 체크
+
+        Returns:
+            {
+                'score': float,    # 0~1
+                'funding_rate': float,
+                'imbalance': float,
+                'aligned': bool
+            }
+        """
+        imbalance_info = OrderbookMetrics.calculate_imbalance(orderbook)
+        funding_rate = ticker_data.get('funding_rate', 0)
+
+        volume_imbalance = imbalance_info['volume_imbalance']
+
+        # Funding rate와 imbalance의 방향 일치 여부
+        # funding_rate > 0: Long이 많음 -> bullish imbalance 기대
+        # funding_rate < 0: Short이 많음 -> bearish imbalance 기대
+        
+        if funding_rate > 0 and volume_imbalance > 0:
+            # 둘다 bullish
+            aligned = True
+            score = min(1.0, abs(funding_rate) * 100 * abs(volume_imbalance))
+        elif funding_rate < 0 and volume_imbalance < 0:
+            # 둘다 bearish
+            aligned = True
+            score = min(1.0, abs(funding_rate) * 100 * abs(volume_imbalance))
+        elif abs(funding_rate) < 0.0001:
+            # Neutral
+            aligned = True
+            score = 1.0  - abs(volume_imbalance) * 0.5
+        else:
+            aligned = False
+            score = 0.5
+
+        return {
+            'score': score,
+            'funding_rate': funding_rate,
+            'imbalance': volume_imbalance,
+            'aligned': aligned
+        }
+    
+
+    def check_depth_adequacy(self, orderbook: OrderbookState) -> Dict:
+        """
+        Depth 충분성 체크
+
+        Returns:
+            {
+                'score': float,   # 0~1
+                'bid_depth': float,
+                'ask_depth': float,
+                'adequate': bool
+            }
+        """
+        depth_info = OrderbookMetrics.calculate_depth(orderbook)
+
+        bid_depth = depth_info['bid_depth']
+        ask_depth = depth_info['ask_depth']
+
+        # 최소 depth 기준
+        min_depth = self.config.min_depth_btc
+
+        # Bid/Ask 각각 평가
+        bid_score = min(1.0, bid_depth / min_depth) if min_depth > 0 else 0
+        ask_score = min(1.0, ask_depth / min_depth) if min_depth > 0 else 0
+
+        # Bid/Ask 균형 평가
+        total_depth = bid_depth + ask_depth
+        if total_depth > 0:
+            balance = 1 - abs(bid_depth - ask_depth) / total_depth
+        else:
+            balance = 0
+
+        # 전체 점수
+        score = (bid_score + ask_score) / 2 * balance
+
+        adequate = (bid_depth >= min_depth and ask_depth >= min_depth)
+
+        return {
+            'score': score,
+            'bid_depth': bid_depth,
+            'ask_depth': ask_depth,
+            'adequate': adequate
+        }
+    
+
+    def check_system_error_rate(self, 
+                                total_events: int,
+                                repairs: int,
+                                quarantines: int) -> Dict:
+        """
+        시스템 에러율 체크
+        
+        Returns:
+            {
+                'score': float,  # 0~1
+                'error_rate': float,
+                'repairs': int,
+                'quarantines': int
+            }
+        """
+        if total_events == 0:
+            return {
+                'score': 1.0,
+                'error_rate': 0.0,
+                'repairs': 0,
+                'quarantines': 0
+            }
+        
+        error_rate = (repairs + quarantines) / total_events
+        
+        # 에러율이 낮을수록 높은 점수
+        # 에러율 5% 이하: 1.0
+        # 에러율 10% 이상: 0.5 이하
+        score = max(0, 1.0 - error_rate * 5)
+        
+        return {
+            'score': score,
+            'error_rate': error_rate,
+            'repairs': repairs,
+            'quarantines': quarantines
+        }
+    
+    def check_overall_consistency(self,
+                                  ticker_data: Dict,
+                                  orderbook: OrderbookState,
+                                  total_events: int,
+                                  repairs: int,
+                                  quarantines: int) -> Dict:
+        """
+        전체 일관성 체크 (5가지 차원 통합)
+        
+        Returns:
+            {
+                'overall_score': float,  # 0~1
+                'price': Dict,
+                'spread': Dict,
+                'imbalance_funding': Dict,
+                'depth': Dict,
+                'system': Dict
+            }
+        """
+        # 5가지 차원 체크
+        price_check = self.check_price_consistency(ticker_data, orderbook)
+        spread_check = self.check_spread_consistency(ticker_data, orderbook)
+        imbalance_check = self.check_imbalance_vs_funding(ticker_data, orderbook)
+        depth_check = self.check_depth_adequacy(orderbook)
+        system_check = self.check_system_error_rate(total_events, repairs, quarantines)
+        
+        # 가중 평균
+        weights = self.config.weights
+        overall_score = (
+            weights['price'] * price_check['score'] +
+            weights['spread'] * spread_check['score'] +
+            weights['imbalance_funding'] * imbalance_check['score'] +
+            weights['depth'] * depth_check['score'] +
+            weights['system'] * system_check['score']
+        )
+        
+        return {
+            'overall_score': overall_score,
+            'price': price_check,
+            'spread': spread_check,
+            'imbalance_funding': imbalance_check,
+            'depth': depth_check,
+            'system': system_check
+        }
