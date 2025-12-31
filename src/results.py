@@ -26,6 +26,11 @@ class ProcessingResult:
     trade_accepts: int = 0
     trade_quarantines: int = 0
     
+    # Drop 통계 (stale 이벤트)
+    events_dropped: int = 0
+    orderbook_dropped: int = 0
+    trades_dropped: int = 0
+    
     # Consistency Check 결과 (3가지)
     check_failures: Dict[str, int] = field(default_factory=lambda: {
         'spread_valid': 0,
@@ -49,16 +54,9 @@ class ProcessingResult:
     # State 전이 기록
     state_transitions: List[Dict] = field(default_factory=list)
     
-    # Lateness 통계
-    lateness_stats: Dict[str, float] = field(default_factory=lambda: {
-        'total_checks': 0,
-        'within_allowed': 0,
-        'degraded_range': 0,
-        'exceeded': 0,
-        'max_lateness_ms': 0.0,
-        'sum_lateness_ms': 0.0,
-    })
-    avg_lateness_ms: float = 0.0
+    # Lateness 통계 (이벤트 타입별)
+    lateness_stats: Dict[str, Dict] = field(default_factory=dict)
+    avg_lateness_by_type: Dict[str, float] = field(default_factory=dict)
     
     # ====== 계산 속성들 ======
     
@@ -71,6 +69,16 @@ class ProcessingResult:
     def trade_quarantine_rate(self) -> float:
         total = self.trade_accepts + self.trade_quarantines
         return self.trade_quarantines / total if total > 0 else 0.0
+    
+    @property
+    def orderbook_drop_rate(self) -> float:
+        total = self.total_orderbook_updates + self.orderbook_dropped
+        return self.orderbook_dropped / total if total > 0 else 0.0
+    
+    @property
+    def trade_drop_rate(self) -> float:
+        total = self.total_trades + self.trades_dropped
+        return self.trades_dropped / total if total > 0 else 0.0
     
     @property
     def trusted_rate(self) -> float:
@@ -87,26 +95,19 @@ class ProcessingResult:
         total = sum(self.state_counts.values())
         return self.state_counts['UNTRUSTED'] / total if total > 0 else 0.0
     
-    @property
-    def lateness_within_allowed_rate(self) -> float:
-        total = self.lateness_stats.get('total_checks', 0)
-        return self.lateness_stats.get('within_allowed', 0) / total if total > 0 else 0.0
-    
-    @property
-    def lateness_degraded_rate(self) -> float:
-        total = self.lateness_stats.get('total_checks', 0)
-        return self.lateness_stats.get('degraded_range', 0) / total if total > 0 else 0.0
-    
-    @property
-    def lateness_exceeded_rate(self) -> float:
-        total = self.lateness_stats.get('total_checks', 0)
-        return self.lateness_stats.get('exceeded', 0) / total if total > 0 else 0.0
-    
     def get_check_fail_rate(self, check_name: str) -> float:
         passes = self.check_passes.get(check_name, 0)
         fails = self.check_failures.get(check_name, 0)
         total = passes + fails
         return fails / total if total > 0 else 0.0
+    
+    def get_avg_lateness(self, event_type: str) -> float:
+        return self.avg_lateness_by_type.get(event_type, 0.0)
+    
+    def get_max_lateness(self, event_type: str) -> float:
+        if event_type in self.lateness_stats:
+            return self.lateness_stats[event_type].get('max_ms', 0.0)
+        return 0.0
     
     # ====== 출력 메서드들 ======
     
@@ -119,10 +120,11 @@ class ProcessingResult:
             'total_tickers': self.total_tickers,
             'trade_accept_rate': self.trade_accept_rate,
             'trade_quarantine_rate': self.trade_quarantine_rate,
+            'orderbook_drop_rate': self.orderbook_drop_rate,
+            'trade_drop_rate': self.trade_drop_rate,
             'check_failures': self.check_failures,
             'state_counts': self.state_counts,
             'lateness_stats': self.lateness_stats,
-            'avg_lateness_ms': self.avg_lateness_ms,
         }
     
     def to_json(self, indent: int = 2) -> str:
@@ -141,23 +143,26 @@ class ProcessingResult:
         print(f"  - Snapshots: {self.total_snapshots:,}")
         print(f"  처리 시간: {self.processing_time_sec:.2f}초")
         
+        print(f"\n[Event Drop (Stale 이벤트)]")
+        print(f"  Orderbook dropped: {self.orderbook_dropped:,} ({self.orderbook_drop_rate:.2%})")
+        print(f"  Trades dropped: {self.trades_dropped:,} ({self.trade_drop_rate:.2%})")
+        
+        print(f"\n[Event Lateness (ms)]")
+        for event_type in ['orderbook', 'trade', 'ticker']:
+            avg = self.get_avg_lateness(event_type)
+            max_val = self.get_max_lateness(event_type)
+            print(f"  {event_type}: avg={avg:.2f}, max={max_val:.2f}")
+        
         print(f"\n[Trade Validation]")
         print(f"  Accept: {self.trade_accepts:,} ({self.trade_accept_rate:.1%})")
         print(f"  Quarantine: {self.trade_quarantines:,} ({self.trade_quarantine_rate:.1%})")
         
-        print(f"\n[Consistency Check 실패율]")
+        print(f"\n[Consistency Check 실패율] (Effective Orderbook 기준)")
         for check_name in self.check_failures.keys():
             fail_rate = self.get_check_fail_rate(check_name)
             fails = self.check_failures[check_name]
             emoji = "✅" if fail_rate < 0.01 else "⚠️" if fail_rate < 0.05 else "❌"
             print(f"  {emoji} {check_name}: {fails:,} fails ({fail_rate:.2%})")
-        
-        print(f"\n[Lateness 통계]")
-        print(f"  평균: {self.avg_lateness_ms:.2f}ms")
-        print(f"  최대: {self.lateness_stats.get('max_lateness_ms', 0):.2f}ms")
-        print(f"  정상 (≤50ms): {self.lateness_within_allowed_rate:.1%}")
-        print(f"  지연 (50-200ms): {self.lateness_degraded_rate:.1%}")
-        print(f"  초과 (>200ms): {self.lateness_exceeded_rate:.1%}")
         
         print(f"\n[State 분포]")
         print(f"  TRUSTED: {self.state_counts['TRUSTED']:,} ({self.trusted_rate:.1%})")
@@ -172,50 +177,56 @@ def compare_results(research: ProcessingResult, validation: ProcessingResult):
     print(f"{'='*70}")
     
     # 헤더
-    print(f"\n{'지표':<35} {'Research':>15} {'Validation':>15} {'차이':>10}")
-    print(f"{'-'*70}")
+    print(f"\n{'지표':<40} {'Research':>12} {'Validation':>12} {'차이':>10}")
+    print(f"{'-'*75}")
     
     # Trade Validation
-    print(f"{'Trade Accept Rate':<35} {research.trade_accept_rate:>14.1%} {validation.trade_accept_rate:>14.1%} {validation.trade_accept_rate - research.trade_accept_rate:>+9.1%}")
-    print(f"{'Trade Quarantine Rate':<35} {research.trade_quarantine_rate:>14.1%} {validation.trade_quarantine_rate:>14.1%} {validation.trade_quarantine_rate - research.trade_quarantine_rate:>+9.1%}")
+    print(f"{'Trade Accept Rate':<40} {research.trade_accept_rate:>11.1%} {validation.trade_accept_rate:>11.1%} {validation.trade_accept_rate - research.trade_accept_rate:>+9.1%}")
+    print(f"{'Trade Quarantine Rate':<40} {research.trade_quarantine_rate:>11.1%} {validation.trade_quarantine_rate:>11.1%} {validation.trade_quarantine_rate - research.trade_quarantine_rate:>+9.1%}")
     
-    print(f"{'-'*70}")
+    print(f"{'-'*75}")
+    
+    # Drop Rate
+    print(f"{'Orderbook Drop Rate (stale)':<40} {research.orderbook_drop_rate:>11.2%} {validation.orderbook_drop_rate:>11.2%} {validation.orderbook_drop_rate - research.orderbook_drop_rate:>+9.2%}")
+    print(f"{'Trade Drop Rate (stale)':<40} {research.trade_drop_rate:>11.2%} {validation.trade_drop_rate:>11.2%} {validation.trade_drop_rate - research.trade_drop_rate:>+9.2%}")
+    
+    print(f"{'-'*75}")
+    
+    # Lateness
+    print(f"{'Orderbook Avg Lateness (ms)':<40} {research.get_avg_lateness('orderbook'):>11.2f} {validation.get_avg_lateness('orderbook'):>11.2f} {validation.get_avg_lateness('orderbook') - research.get_avg_lateness('orderbook'):>+9.2f}")
+    print(f"{'Orderbook Max Lateness (ms)':<40} {research.get_max_lateness('orderbook'):>11.2f} {validation.get_max_lateness('orderbook'):>11.2f} {validation.get_max_lateness('orderbook') - research.get_max_lateness('orderbook'):>+9.2f}")
+    print(f"{'Trade Avg Lateness (ms)':<40} {research.get_avg_lateness('trade'):>11.2f} {validation.get_avg_lateness('trade'):>11.2f} {validation.get_avg_lateness('trade') - research.get_avg_lateness('trade'):>+9.2f}")
+    
+    print(f"{'-'*75}")
     
     # Consistency Check 실패율
     for check_name in research.check_failures.keys():
         r_rate = research.get_check_fail_rate(check_name)
         v_rate = validation.get_check_fail_rate(check_name)
         diff = v_rate - r_rate
-        print(f"{check_name + ' fail rate':<35} {r_rate:>14.2%} {v_rate:>14.2%} {diff:>+9.2%}")
+        print(f"{check_name + ' fail rate':<40} {r_rate:>11.2%} {v_rate:>11.2%} {diff:>+9.2%}")
     
-    print(f"{'-'*70}")
-    
-    # Lateness
-    print(f"{'Avg Lateness (ms)':<35} {research.avg_lateness_ms:>14.2f} {validation.avg_lateness_ms:>14.2f} {validation.avg_lateness_ms - research.avg_lateness_ms:>+9.2f}")
-    print(f"{'Lateness Within Allowed %':<35} {research.lateness_within_allowed_rate:>14.1%} {validation.lateness_within_allowed_rate:>14.1%} {validation.lateness_within_allowed_rate - research.lateness_within_allowed_rate:>+9.1%}")
-    print(f"{'Lateness Exceeded %':<35} {research.lateness_exceeded_rate:>14.1%} {validation.lateness_exceeded_rate:>14.1%} {validation.lateness_exceeded_rate - research.lateness_exceeded_rate:>+9.1%}")
-    
-    print(f"{'-'*70}")
+    print(f"{'-'*75}")
     
     # State 분포
-    print(f"{'TRUSTED %':<35} {research.trusted_rate:>14.1%} {validation.trusted_rate:>14.1%} {validation.trusted_rate - research.trusted_rate:>+9.1%}")
-    print(f"{'DEGRADED %':<35} {research.degraded_rate:>14.1%} {validation.degraded_rate:>14.1%} {validation.degraded_rate - research.degraded_rate:>+9.1%}")
-    print(f"{'UNTRUSTED %':<35} {research.untrusted_rate:>14.1%} {validation.untrusted_rate:>14.1%} {validation.untrusted_rate - research.untrusted_rate:>+9.1%}")
+    print(f"{'TRUSTED %':<40} {research.trusted_rate:>11.1%} {validation.trusted_rate:>11.1%} {validation.trusted_rate - research.trusted_rate:>+9.1%}")
+    print(f"{'DEGRADED %':<40} {research.degraded_rate:>11.1%} {validation.degraded_rate:>11.1%} {validation.degraded_rate - research.degraded_rate:>+9.1%}")
+    print(f"{'UNTRUSTED %':<40} {research.untrusted_rate:>11.1%} {validation.untrusted_rate:>11.1%} {validation.untrusted_rate - research.untrusted_rate:>+9.1%}")
     
-    print(f"\n{'='*70}")
+    print(f"\n{'='*75}")
     
     # 핵심 인사이트
     print(f"\n[핵심 인사이트]")
+    
+    # Drop rate 차이
+    ob_drop_diff = validation.orderbook_drop_rate - research.orderbook_drop_rate
+    if ob_drop_diff > 0.01:
+        print(f"  ⚠️ Validation에서 Orderbook Drop Rate가 {ob_drop_diff:.2%}p 높음 → Stale 이벤트 많음")
     
     # Quarantine rate 차이
     q_diff = validation.trade_quarantine_rate - research.trade_quarantine_rate
     if q_diff > 0.01:
         print(f"  ⚠️ Validation에서 Trade Quarantine이 {q_diff:.1%}p 높음")
-    
-    # Lateness 차이
-    l_diff = validation.lateness_exceeded_rate - research.lateness_exceeded_rate
-    if l_diff > 0.01:
-        print(f"  ⚠️ Validation에서 Lateness 초과가 {l_diff:.1%}p 높음")
     
     # UNTRUSTED 증가
     u_diff = validation.untrusted_rate - research.untrusted_rate
@@ -230,3 +241,8 @@ def compare_results(research: ProcessingResult, validation: ProcessingResult):
     max_fail_rate = validation.get_check_fail_rate(max_fail_check)
     if max_fail_rate > 0.01:
         print(f"  ⚠️ 가장 많이 실패한 체크: {max_fail_check} ({max_fail_rate:.2%})")
+    
+    # Drop rate이 높은데 Consistency가 좋으면
+    if validation.orderbook_drop_rate > research.orderbook_drop_rate:
+        if validation.trusted_rate >= research.trusted_rate * 0.9:
+            print(f"  ✅ Stale 이벤트 필터링으로 Effective OB 품질 유지됨")
