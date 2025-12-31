@@ -1,28 +1,19 @@
 """
-DataFrame 기반 스트림 시뮬레이터
+DataFrame 기반 스트림 시뮬레이터 (최적화 버전)
 """
 import pandas as pd
+import numpy as np
 from typing import Optional, Dict, List
-from collections import deque
 from src.data_types import Event
 from src.enums import EventType
 from src.data_loader import DataLoader
 
 
 class DataFrameStreamer:
-    """DataFrame을 실시간 스트림처럼 처리하는 시뮬레이터"""
+    """DataFrame을 실시간 스트림처럼 처리하는 시뮬레이터 (최적화)"""
     
     @classmethod
     def from_loader(cls, loader: DataLoader) -> 'DataFrameStreamer':
-        """
-        DataLoader로부터 Streamer 생성
-        
-        Args:
-            loader: 데이터가 로드된 DataLoader 인스턴스
-            
-        Returns:
-            DataFrameStreamer 인스턴스
-        """
         orderbook = loader.get_stream('orderbook')
         trades = loader.get_stream('trades')
         ticker = loader.get_stream('ticker')
@@ -40,86 +31,76 @@ class DataFrameStreamer:
                  orderbook_df: pd.DataFrame,
                  trades_df: pd.DataFrame,
                  ticker_df: pd.DataFrame):
-        """
-        Args:
-            orderbook_df: Orderbook DataFrame
-            trades_df: Trades DataFrame
-            ticker_df: Ticker DataFrame
-        """
         
-        # 데이터 복사 및 정렬
-        self.orderbook = orderbook_df.sort_values('local_timestamp').reset_index(drop=True)
-        self.trades = trades_df.sort_values('local_timestamp').reset_index(drop=True)
+        print("⚡ 최적화된 Streamer 초기화 중...")
         
-        # Ticker 중복 제거 및 정렬
+        # 1. Snapshot 분리 및 그룹화
+        self.snapshot_groups = self._group_snapshots(orderbook_df)
+        
+        # 2. Snapshot 제외한 orderbook만 필터링
+        if 'is_snapshot' in orderbook_df.columns:
+            orderbook_updates = orderbook_df[orderbook_df['is_snapshot'] != True].copy()
+        else:
+            orderbook_updates = orderbook_df.copy()
+        
+        # 3. NumPy 배열로 변환 (핵심 최적화)
+        # Orderbook
+        self.ob_timestamps = orderbook_updates['local_timestamp'].values
+        self.ob_event_timestamps = orderbook_updates['timestamp'].values
+        self.ob_prices = orderbook_updates['price'].values.astype(np.float64)
+        self.ob_amounts = orderbook_updates['amount'].values.astype(np.float64)
+        self.ob_sides = orderbook_updates['side'].values
+        self.ob_len = len(orderbook_updates)
+        self.ob_idx = 0
+        
+        # Trades
+        trades_sorted = trades_df.sort_values('local_timestamp').reset_index(drop=True)
+        self.tr_timestamps = trades_sorted['local_timestamp'].values
+        self.tr_event_timestamps = trades_sorted['timestamp'].values
+        self.tr_prices = trades_sorted['price'].values.astype(np.float64)
+        self.tr_amounts = trades_sorted['amount'].values.astype(np.float64)
+        self.tr_sides = trades_sorted['side'].values
+        self.tr_len = len(trades_sorted)
+        self.tr_idx = 0
+        
+        # Ticker - DataFrame 유지 (컬럼이 많아서)
         self.ticker = ticker_df.drop_duplicates(
-            subset=['timestamp'], 
-            keep='first'
+            subset=['timestamp'], keep='first'
         ).sort_values('local_timestamp').reset_index(drop=True)
+        self.tk_timestamps = self.ticker['local_timestamp'].values
+        self.tk_len = len(self.ticker)
+        self.tk_idx = 0
         
-        # Snapshot 그룹화
-        self.snapshot_groups = self._group_snapshots()
+        # Snapshot
+        self.snapshot_timestamps = np.array([s['local_timestamp'] for s in self.snapshot_groups])
+        self.snap_len = len(self.snapshot_groups)
+        self.snap_idx = 0
         
-        # 현재 읽기 위치
-        self.orderbook_idx = 0
-        self.trades_idx = 0
-        self.ticker_idx = 0
-        self.snapshot_group_idx = 0
-        
-        print(f"✅ DataFrameStreamer 초기화 완료")
-        print(f"  Orderbook: {len(self.orderbook):,} rows")
-        print(f"  Trades: {len(self.trades):,} rows")
-        print(f"  Ticker: {len(self.ticker):,} rows (중복 제거 후)")
-        print(f"  Snapshot groups: {len(self.snapshot_groups)} groups")
+        print(f"✅ 최적화된 Streamer 초기화 완료")
+        print(f"  Orderbook updates: {self.ob_len:,}")
+        print(f"  Trades: {self.tr_len:,}")
+        print(f"  Ticker: {self.tk_len:,}")
+        print(f"  Snapshots: {self.snap_len}")
     
-    def _group_snapshots(self) -> List[Dict]:
-        """
-        Orderbook snapshot을 timestamp별로 그룹화
-        
-        Returns:
-            List of snapshot groups
-            [
-                {
-                    'timestamp': int,
-                    'local_timestamp': int,
-                    'bids': [[price, amount], ...],
-                    'asks': [[price, amount], ...]
-                },
-                ...
-            ]
-        """
-        # ⭐ 컬럼 존재 확인
-        if 'is_snapshot' not in self.orderbook.columns:
-            print("⚠️ Warning: 'is_snapshot' 컬럼이 없습니다.")
+    def _group_snapshots(self, orderbook_df: pd.DataFrame) -> List[Dict]:
+        """Snapshot 그룹화"""
+        if 'is_snapshot' not in orderbook_df.columns:
             return []
         
-        # ⭐ 올바른 필터링 (DataFrame 인덱싱)
-        snapshots = self.orderbook[self.orderbook['is_snapshot'] == True].copy()
-        
+        snapshots = orderbook_df[orderbook_df['is_snapshot'] == True]
         if snapshots.empty:
-            print("⚠️ Snapshot이 없습니다.")
             return []
         
-        print(f"✅ Snapshot 발견: {len(snapshots):,} rows")
-        
-        # Timestamp별로 그룹화
         snapshot_groups = []
-        
-        unique_timestamps = snapshots['timestamp'].unique()
-        print(f"✅ Unique snapshot timestamps: {len(unique_timestamps)}")
-        
-        for ts in unique_timestamps:
+        for ts in snapshots['timestamp'].unique():
             group = snapshots[snapshots['timestamp'] == ts]
-            
             bids = []
             asks = []
             
             for _, row in group.iterrows():
                 price = float(row['price'])
                 amount = float(row['amount'])
-                side = row['side']
-                
-                if side == 'bid':
+                if row['side'] == 'bid':
                     bids.append([price, amount])
                 else:
                     asks.append([price, amount])
@@ -130,111 +111,73 @@ class DataFrameStreamer:
                 'bids': bids,
                 'asks': asks
             })
-            
-            print(f"  Snapshot @ {ts}: {len(bids)} bids, {len(asks)} asks")
         
-        # local_timestamp 순으로 정렬
         snapshot_groups.sort(key=lambda x: x['local_timestamp'])
-        
-        print(f"✅ Snapshot 그룹 생성 완료: {len(snapshot_groups)} groups")
-        
         return snapshot_groups
-    
-
-    def _create_orderbook_event(self, row: pd.Series) -> Event:
-        """Orderbook Update Event 생성"""
-        return Event(
-            event_type=EventType.ORDERBOOK,
-            timestamp=int(row['timestamp']),
-            local_timestamp=int(row['local_timestamp']),
-            data={
-                'is_snapshot': bool(row['is_snapshot']),  # ⭐ 명시적 bool 변환
-                'price': float(row['price']),
-                'amount': float(row['amount']),
-                'side': row['side']
-            }
-        )
-
 
     def get_next_event(self) -> Optional[Event]:
-        """
-        다음 이벤트 가져오기 (시간순)
+        """다음 이벤트 가져오기 (최적화)"""
         
-        Returns:
-            Event 또는 None (더 이상 없으면)
-        """
-        while True:  # 재귀 대신 반복문 사용
-            candidates = []
-            
-            # 1. Snapshot group
-            if self.snapshot_group_idx < len(self.snapshot_groups):
-                snapshot_group = self.snapshot_groups[self.snapshot_group_idx]
-                candidates.append({
-                    'type': 'snapshot',
-                    'timestamp': snapshot_group['local_timestamp'],
-                    'data': snapshot_group
-                })
-            
-            # 2. Orderbook update (snapshot 제외)
-            # Snapshot 행들을 먼저 건너뛰기
-            while self.orderbook_idx < len(self.orderbook):
-                row = self.orderbook.iloc[self.orderbook_idx]
-                if row['is_snapshot'] == True:
-                    self.orderbook_idx += 1
-                    continue
-                else:
-                    candidates.append({
-                        'type': 'orderbook',
-                        'timestamp': row['local_timestamp'],
-                        'data': row
-                    })
-                    break
-            
-            # 3. Trade
-            if self.trades_idx < len(self.trades):
-                row = self.trades.iloc[self.trades_idx]
-                candidates.append({
-                    'type': 'trade',
-                    'timestamp': row['local_timestamp'],
-                    'data': row
-                })
-            
-            # 4. Ticker
-            if self.ticker_idx < len(self.ticker):
-                row = self.ticker.iloc[self.ticker_idx]
-                candidates.append({
-                    'type': 'ticker',
-                    'timestamp': row['local_timestamp'],
-                    'data': row
-                })
-            
-            # 후보가 없으면 종료
-            if not candidates:
-                return None
-            
-            # 가장 빠른 timestamp 선택
-            earliest = min(candidates, key=lambda x: x['timestamp'])
-            
-            # Event 생성 및 인덱스 증가
-            if earliest['type'] == 'snapshot':
-                event = self._create_snapshot_event(earliest['data'])
-                self.snapshot_group_idx += 1
-                return event
-            elif earliest['type'] == 'orderbook':
-                event = self._create_orderbook_event(earliest['data'])
-                self.orderbook_idx += 1
-                return event
-            elif earliest['type'] == 'trade':
-                event = self._create_trade_event(earliest['data'])
-                self.trades_idx += 1
-                return event
-            elif earliest['type'] == 'ticker':
-                event = self._create_ticker_event(earliest['data'])
-                self.ticker_idx += 1
-                return event
+        # 각 스트림의 다음 timestamp 가져오기 (없으면 inf)
+        ob_ts = self.ob_timestamps[self.ob_idx] if self.ob_idx < self.ob_len else np.inf
+        tr_ts = self.tr_timestamps[self.tr_idx] if self.tr_idx < self.tr_len else np.inf
+        tk_ts = self.tk_timestamps[self.tk_idx] if self.tk_idx < self.tk_len else np.inf
+        snap_ts = self.snapshot_timestamps[self.snap_idx] if self.snap_idx < self.snap_len else np.inf
+        
+        # 모두 inf면 종료
+        min_ts = min(ob_ts, tr_ts, tk_ts, snap_ts)
+        if min_ts == np.inf:
+            return None
+        
+        # 가장 빠른 이벤트 선택 및 반환
+        if min_ts == snap_ts:
+            event = self._create_snapshot_event(self.snapshot_groups[self.snap_idx])
+            self.snap_idx += 1
+            return event
+        
+        if min_ts == ob_ts:
+            event = Event(
+                event_type=EventType.ORDERBOOK,
+                timestamp=int(self.ob_event_timestamps[self.ob_idx]),
+                local_timestamp=int(self.ob_timestamps[self.ob_idx]),
+                data={
+                    'is_snapshot': False,
+                    'price': self.ob_prices[self.ob_idx],
+                    'amount': self.ob_amounts[self.ob_idx],
+                    'side': self.ob_sides[self.ob_idx]
+                }
+            )
+            self.ob_idx += 1
+            return event
+        
+        if min_ts == tr_ts:
+            event = Event(
+                event_type=EventType.TRADE,
+                timestamp=int(self.tr_event_timestamps[self.tr_idx]),
+                local_timestamp=int(self.tr_timestamps[self.tr_idx]),
+                data={
+                    'price': self.tr_prices[self.tr_idx],
+                    'amount': self.tr_amounts[self.tr_idx],
+                    'side': self.tr_sides[self.tr_idx]
+                }
+            )
+            self.tr_idx += 1
+            return event
+        
+        if min_ts == tk_ts:
+            row = self.ticker.iloc[self.tk_idx]
+            event = Event(
+                event_type=EventType.TICKER,
+                timestamp=int(row['timestamp']),
+                local_timestamp=int(row['local_timestamp']),
+                data=row.to_dict()
+            )
+            self.tk_idx += 1
+            return event
+        
+        return None
     
     def _create_snapshot_event(self, snapshot_group: Dict) -> Event:
-        """Snapshot Event 생성"""
         return Event(
             event_type=EventType.ORDERBOOK,
             timestamp=snapshot_group['timestamp'],
@@ -246,83 +189,24 @@ class DataFrameStreamer:
             }
         )
     
-    def _create_orderbook_event(self, row: pd.Series) -> Event:
-        """Orderbook Update Event 생성"""
-        return Event(
-            event_type=EventType.ORDERBOOK,
-            timestamp=int(row['timestamp']),
-            local_timestamp=int(row['local_timestamp']),
-            data={
-                'is_snapshot': False,
-                'price': float(row['price']),
-                'amount': float(row['amount']),
-                'side': row['side']
-            }
-        )
-    
-    def _create_trade_event(self, row: pd.Series) -> Event:
-        """Trade Event 생성"""
-        return Event(
-            event_type=EventType.TRADE,
-            timestamp=int(row['timestamp']),
-            local_timestamp=int(row['local_timestamp']),
-            data={
-                'price': float(row['price']),
-                'amount': float(row['amount']),
-                'side': row['side']
-            }
-        )
-    
-    def _create_ticker_event(self, row: pd.Series) -> Event:
-        """Ticker Event 생성"""
-        # Ticker 데이터의 모든 컬럼을 포함
-        data = row.to_dict()
-        
-        # timestamp는 int로 변환
-        if 'timestamp' in data:
-            data['timestamp'] = int(data['timestamp'])
-        if 'local_timestamp' in data:
-            data['local_timestamp'] = int(data['local_timestamp'])
-        
-        return Event(
-            event_type=EventType.TICKER,
-            timestamp=int(row['timestamp']),
-            local_timestamp=int(row['local_timestamp']),
-            data=data
-        )
-    
     def has_more_events(self) -> bool:
-        """아직 처리할 이벤트가 있는지"""
         return (
-            self.snapshot_group_idx < len(self.snapshot_groups) or
-            self.orderbook_idx < len(self.orderbook) or
-            self.trades_idx < len(self.trades) or
-            self.ticker_idx < len(self.ticker)
+            self.ob_idx < self.ob_len or
+            self.tr_idx < self.tr_len or
+            self.tk_idx < self.tk_len or
+            self.snap_idx < self.snap_len
         )
     
     def get_progress(self) -> Dict[str, str]:
-        """
-        현재 진행 상황
-        
-        Returns:
-            {
-                'orderbook': '1000 / 10000',
-                'trades': '500 / 5000',
-                'ticker': '100 / 1000',
-                'snapshot_groups': '1 / 5'
-            }
-        """
         return {
-            'orderbook': f"{self.orderbook_idx:,} / {len(self.orderbook):,}",
-            'trades': f"{self.trades_idx:,} / {len(self.trades):,}",
-            'ticker': f"{self.ticker_idx:,} / {len(self.ticker):,}",
-            'snapshot_groups': f"{self.snapshot_group_idx} / {len(self.snapshot_groups)}"
+            'orderbook': f"{self.ob_idx:,} / {self.ob_len:,}",
+            'trades': f"{self.tr_idx:,} / {self.tr_len:,}",
+            'ticker': f"{self.tk_idx:,} / {self.tk_len:,}",
+            'snapshots': f"{self.snap_idx} / {self.snap_len}"
         }
     
     def reset(self):
-        """스트림을 처음부터 다시 시작"""
-        self.orderbook_idx = 0
-        self.trades_idx = 0
-        self.ticker_idx = 0
-        self.snapshot_group_idx = 0
-        print("🔄 Streamer reset complete")
+        self.ob_idx = 0
+        self.tr_idx = 0
+        self.tk_idx = 0
+        self.snap_idx = 0
