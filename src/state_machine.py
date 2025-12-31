@@ -41,7 +41,23 @@ class SystemState:
 
 class StateMachine:
 
-    def __init__(self):
+    def __init__(
+            self,
+            window: int = 3000,    # 3 sec window
+            lateness: int = 1000,  # 1 sec lateness
+            buffer: int = 100, # 100 event buffer
+            watermark: int = 50
+            ):
+        # Time alignment parameter
+        self.window = window
+        self.lateness = lateness
+        self.buffer = buffer
+        self.watermark = watermark
+
+        self.current_watermark = None
+
+        self.event_buffer = []
+
         # Initial state.
         self.data_trust = DataTrustState.TRUSTED
         self.hypothesis = HypothesisState.VALID
@@ -50,9 +66,11 @@ class StateMachine:
         # Statistics
         self.stats = {
             'total_events': 0,
-            'quarantine_count': 0,
-            'repair_count': 0,
-            'accept_count': 0
+            'accepted': 0,
+            'repaired': 0,
+            'quarantined': 0,
+            'out_of_order': 0,
+            'late_arrivals': 0
         }
 
         self.state_history = []
