@@ -58,8 +58,12 @@ def process_dataset(data_dir: str, dataset_name: str) -> ProcessingResult:
             # 진행 상황 출력 (10000개마다)
             if event_count % 10000 == 0:
                 progress = streamer.get_progress()
+                ob_size = 0
+                if processor.current_orderbook:
+                    ob_size = len(processor.current_orderbook.bid_levels) + len(processor.current_orderbook.ask_levels)
                 print(f"  Processed {event_count:,} events... "
-                      f"(OB: {progress['orderbook']}, Trades: {progress['trades']})")
+                      f"OB size: {ob_size:,}, "
+                      f"Buffer: {len(processor.main_buffer):,}")
     
     # 남은 버퍼 처리
     processor.process_buffer()
@@ -68,22 +72,29 @@ def process_dataset(data_dir: str, dataset_name: str) -> ProcessingResult:
     result = processor.get_result()
     result.print_summary()
     
+    # 메모리 해제
+    del streamer
+    del processor
+    del loader
+    import gc
+    gc.collect()
+
     return result
 
 
 def run_comparison(research_dir: str, validation_dir: str) -> dict:
     """
     Research와 Validation 데이터 비교 분석
-    
-    Args:
-        research_dir: Research 데이터 디렉토리
-        validation_dir: Validation 데이터 디렉토리
-    
-    Returns:
-        {'research': ProcessingResult, 'validation': ProcessingResult}
+    (메모리 최적화 버전)
     """
+    import gc
+    
     # Research 처리
     research_result = process_dataset(research_dir, "Research")
+    
+    # 메모리 해제
+    gc.collect()
+    print("\n🧹 메모리 정리 완료\n")
     
     # Validation 처리
     validation_result = process_dataset(validation_dir, "Validation")

@@ -1,10 +1,5 @@
 """
-실시간 스트림 처리 엔진 (Simple Version)
-
-수정 사항:
-- Tolerance 파라미터 제거
-- ProcessingResult와 연동
-- Trade validation 단순화
+실시간 스트림 처리 엔진 (Simple Version + 최적화)
 """
 import time
 from collections import deque
@@ -24,18 +19,21 @@ class StreamProcessor:
                  buffer_size: int = 1000,
                  watermark_delay_ms: int = 50,
                  snapshot_buffer_size: int = 5,
-                 dataset_name: str = ""):
+                 dataset_name: str = "",
+                 max_orderbook_levels: int = 500):
         """
         Args:
             buffer_size: 메인 버퍼 크기
             watermark_delay_ms: Watermark 지연 시간 (ms)
             snapshot_buffer_size: Snapshot 버퍼 크기
             dataset_name: 데이터셋 이름 (결과 식별용)
+            max_orderbook_levels: Orderbook 최대 레벨 수
         """
         self.buffer_size = buffer_size
         self.watermark_delay_ms = watermark_delay_ms
         self.snapshot_buffer_size = snapshot_buffer_size
         self.dataset_name = dataset_name
+        self.max_orderbook_levels = max_orderbook_levels
 
         # Buffers
         self.main_buffer: List[Event] = []
@@ -197,6 +195,30 @@ class StreamProcessor:
         
         self.current_orderbook.timestamp = event.timestamp
         self.stats['orderbook_updates'] += 1
+        
+        # 주기적으로 Orderbook 크기 제한 (1000번마다)
+        if self.stats['orderbook_updates'] % 1000 == 0:
+            self._trim_orderbook()
+
+
+    def _trim_orderbook(self):
+        """Orderbook 크기 제한 - best price 기준 상위 N개만 유지"""
+        if not self.current_orderbook:
+            return
+        
+        max_levels = self.max_orderbook_levels
+        bids = self.current_orderbook.bid_levels
+        asks = self.current_orderbook.ask_levels
+        
+        # Bid: 높은 가격 순으로 상위 N개만 유지
+        if len(bids) > max_levels:
+            sorted_prices = sorted(bids.keys(), reverse=True)[:max_levels]
+            self.current_orderbook.bid_levels = {p: bids[p] for p in sorted_prices}
+        
+        # Ask: 낮은 가격 순으로 상위 N개만 유지
+        if len(asks) > max_levels:
+            sorted_prices = sorted(asks.keys())[:max_levels]
+            self.current_orderbook.ask_levels = {p: asks[p] for p in sorted_prices}
 
     
     def _process_trade(self, event: Event):
@@ -222,14 +244,11 @@ class StreamProcessor:
         체크 항목:
         1. Orderbook이 존재하는가?
         2. Trade price가 현재 best bid/ask 범위 내에 있는가?
-        
-        Tolerance 없음 - 단순한 범위 체크만
         """
         if not self.current_orderbook:
             return RepairAction.QUARANTINE
         
         price = float(event.data['price'])
-        side = event.data['side']
         
         best_bid = self.current_orderbook.get_best_bid()
         best_ask = self.current_orderbook.get_best_ask()
@@ -238,9 +257,6 @@ class StreamProcessor:
             return RepairAction.QUARANTINE
         
         # 단순한 범위 체크
-        # Buy trade: best_bid 이상, best_ask 이하에서 체결되어야 함
-        # Sell trade: best_bid 이상, best_ask 이하에서 체결되어야 함
-        # (약간의 여유: spread의 절반)
         spread = best_ask - best_bid
         margin = spread * 0.5  # spread의 절반만큼 여유
         
@@ -375,11 +391,10 @@ class StreamProcessor:
         print(f"\n  Buffer Status:")
         print(f"    Main Buffer: {len(self.main_buffer)} / {self.buffer_size}")
         print(f"    Snapshot Buffer: {len(self.snapshot_buffer)} / {self.snapshot_buffer_size}")
+        print(f"\n  Orderbook:")
+        if self.current_orderbook:
+            ob_size = len(self.current_orderbook.bid_levels) + len(self.current_orderbook.ask_levels)
+            print(f"    Levels: {ob_size} (max: {self.max_orderbook_levels * 2})")
         print(f"\n  Statistics:")
         for key, value in self.stats.items():
             print(f"    {key}: {value:,}")
-        
-        if self.current_orderbook:
-            print(f"\n  Current Orderbook:")
-            print(f"    Bid Levels: {len(self.current_orderbook.bid_levels)}")
-            print(f"    Ask Levels: {len(self.current_orderbook.ask_levels)}")
