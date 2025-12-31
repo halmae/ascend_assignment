@@ -1,5 +1,5 @@
 """
-실시간 스트림 처리 엔진 (Simple Version + 최적화)
+실시간 스트림 처리 엔진 (allowed_lateness 추가)
 """
 import time
 from collections import deque
@@ -20,7 +20,9 @@ class StreamProcessor:
                  watermark_delay_ms: int = 50,
                  snapshot_buffer_size: int = 5,
                  dataset_name: str = "",
-                 max_orderbook_levels: int = 500):
+                 max_orderbook_levels: int = 500,
+                 allowed_lateness_ms: float = 50.0,
+                 degraded_lateness_ms: float = 200.0):
         """
         Args:
             buffer_size: 메인 버퍼 크기
@@ -28,12 +30,16 @@ class StreamProcessor:
             snapshot_buffer_size: Snapshot 버퍼 크기
             dataset_name: 데이터셋 이름 (결과 식별용)
             max_orderbook_levels: Orderbook 최대 레벨 수
+            allowed_lateness_ms: 허용 가능한 lateness (ms) - 이하면 정상
+            degraded_lateness_ms: DEGRADED로 강등되는 lateness (ms) - 초과시 UNTRUSTED
         """
         self.buffer_size = buffer_size
         self.watermark_delay_ms = watermark_delay_ms
         self.snapshot_buffer_size = snapshot_buffer_size
         self.dataset_name = dataset_name
         self.max_orderbook_levels = max_orderbook_levels
+        self.allowed_lateness_ms = allowed_lateness_ms
+        self.degraded_lateness_ms = degraded_lateness_ms
 
         # Buffers
         self.main_buffer: List[Event] = []
@@ -60,22 +66,28 @@ class StreamProcessor:
             'trade_quarantines': 0,
         }
         
-        # Consistency Check 통계
+        # Consistency Check 통계 (3가지만)
         self.check_stats = {
             'passes': {
-                'orderbook_exists': 0,
                 'spread_valid': 0,
                 'price_in_spread': 0,
-                'depth_balanced': 0,
                 'funding_imbalance_aligned': 0
             },
             'failures': {
-                'orderbook_exists': 0,
                 'spread_valid': 0,
                 'price_in_spread': 0,
-                'depth_balanced': 0,
                 'funding_imbalance_aligned': 0
             }
+        }
+        
+        # Lateness 통계
+        self.lateness_stats = {
+            'total_checks': 0,
+            'within_allowed': 0,      # < allowed_lateness_ms
+            'degraded_range': 0,      # allowed ~ degraded
+            'exceeded': 0,            # > degraded_lateness_ms
+            'max_lateness_ms': 0.0,
+            'sum_lateness_ms': 0.0,
         }
         
         # State 분포
@@ -239,11 +251,9 @@ class StreamProcessor:
 
     def _validate_trade(self, event: Event) -> RepairAction:
         """
-        Trade 검증 (수정된 버전)
+        Trade 검증
         
-        변경사항:
         - 상대값(spread 기반)과 절대값(1bp) 중 큰 margin 사용
-        - Spread가 좁아도 최소 1bp 여유 보장
         """
         if not self.current_orderbook:
             return RepairAction.QUARANTINE
@@ -259,9 +269,9 @@ class StreamProcessor:
         spread = best_ask - best_bid
         mid_price = (best_bid + best_ask) / 2
         
-        # 수정: 상대값과 절대값 중 큰 것 사용
+        # 상대값과 절대값 중 큰 것 사용
         relative_margin = spread * 0.5
-        absolute_margin = mid_price * 0.0001  # 1bp (0.01%)
+        absolute_margin = mid_price * 0.0001  # 1bp
         margin = max(relative_margin, absolute_margin)
         
         # 범위 체크
@@ -274,7 +284,7 @@ class StreamProcessor:
 
 
     def _process_ticker(self, event: Event):
-        """Ticker 이벤트 처리"""
+        """Ticker 이벤트 처리 (allowed_lateness 포함)"""
         self.stats['ticker_checkpoints'] += 1
         
         # 이전 상태 저장
@@ -288,18 +298,39 @@ class StreamProcessor:
         
         # Check 통계 업데이트
         for check_name, result in report.checks.items():
-            if result == CheckResult.PASS:
-                self.check_stats['passes'][check_name] += 1
-            elif result == CheckResult.FAIL:
-                self.check_stats['failures'][check_name] += 1
+            if check_name in self.check_stats['passes']:
+                if result == CheckResult.PASS:
+                    self.check_stats['passes'][check_name] += 1
+                elif result == CheckResult.FAIL:
+                    self.check_stats['failures'][check_name] += 1
         
-        # State 전환 - 단순한 규칙
-        if report.all_passed:
-            self.data_trust_state = DataTrustState.TRUSTED
-        elif report.fail_count <= 1:
-            self.data_trust_state = DataTrustState.DEGRADED
-        else:
+        # Lateness 통계 업데이트
+        lateness_ms = report.lateness_ms
+        lateness_state = self._update_lateness_stats(lateness_ms)
+        
+        # State 결정 로직
+        # 1. Lateness가 너무 크면 강제 강등
+        # 2. 그렇지 않으면 consistency check 결과로 판단
+        
+        if lateness_state == 'exceeded':
+            # Lateness > degraded_lateness_ms → UNTRUSTED
             self.data_trust_state = DataTrustState.UNTRUSTED
+        elif lateness_state == 'degraded':
+            # allowed < Lateness <= degraded → 최대 DEGRADED
+            if report.all_passed:
+                self.data_trust_state = DataTrustState.DEGRADED
+            elif report.fail_count <= 1:
+                self.data_trust_state = DataTrustState.DEGRADED
+            else:
+                self.data_trust_state = DataTrustState.UNTRUSTED
+        else:
+            # Lateness <= allowed → consistency check 결과로 판단
+            if report.all_passed:
+                self.data_trust_state = DataTrustState.TRUSTED
+            elif report.fail_count <= 1:
+                self.data_trust_state = DataTrustState.DEGRADED
+            else:
+                self.data_trust_state = DataTrustState.UNTRUSTED
         
         # State 분포 업데이트
         self.state_counts[self.data_trust_state.value] += 1
@@ -312,14 +343,46 @@ class StreamProcessor:
                 'from_state': prev_state.value,
                 'to_state': self.data_trust_state.value,
                 'failed_checks': failed_checks,
-                'fail_count': report.fail_count
+                'fail_count': report.fail_count,
+                'lateness_ms': lateness_ms,
+                'lateness_state': lateness_state
             })
         
         # 로그 (100개마다)
         if self.stats['ticker_checkpoints'] % 100 == 0:
             failed = [k for k, v in report.checks.items() if v == CheckResult.FAIL]
+            lateness_str = f"{lateness_ms:.1f}ms" if lateness_ms else "N/A"
             print(f"Ticker #{self.stats['ticker_checkpoints']}: "
-                  f"{self.data_trust_state.value}, failed={failed}")
+                  f"{self.data_trust_state.value}, failed={failed}, lateness={lateness_str}")
+
+
+    def _update_lateness_stats(self, lateness_ms: Optional[float]) -> str:
+        """
+        Lateness 통계 업데이트 및 상태 반환
+        
+        Returns:
+            'within_allowed' | 'degraded' | 'exceeded' | 'unknown'
+        """
+        self.lateness_stats['total_checks'] += 1
+        
+        if lateness_ms is None:
+            return 'unknown'
+        
+        # 통계 업데이트
+        self.lateness_stats['sum_lateness_ms'] += lateness_ms
+        if lateness_ms > self.lateness_stats['max_lateness_ms']:
+            self.lateness_stats['max_lateness_ms'] = lateness_ms
+        
+        # 상태 판정
+        if lateness_ms <= self.allowed_lateness_ms:
+            self.lateness_stats['within_allowed'] += 1
+            return 'within_allowed'
+        elif lateness_ms <= self.degraded_lateness_ms:
+            self.lateness_stats['degraded_range'] += 1
+            return 'degraded'
+        else:
+            self.lateness_stats['exceeded'] += 1
+            return 'exceeded'
 
         
     def _process_liquidation(self, event: Event):
@@ -366,6 +429,11 @@ class StreamProcessor:
         """처리 결과 반환"""
         processing_time = time.time() - self.start_time if self.start_time else 0
         
+        # 평균 lateness 계산
+        avg_lateness = 0.0
+        if self.lateness_stats['total_checks'] > 0:
+            avg_lateness = self.lateness_stats['sum_lateness_ms'] / self.lateness_stats['total_checks']
+        
         result = ProcessingResult(
             dataset_name=self.dataset_name,
             processing_time_sec=processing_time,
@@ -379,7 +447,9 @@ class StreamProcessor:
             check_failures=self.check_stats['failures'].copy(),
             check_passes=self.check_stats['passes'].copy(),
             state_counts=self.state_counts.copy(),
-            state_transitions=self.state_transitions.copy()
+            state_transitions=self.state_transitions.copy(),
+            lateness_stats=self.lateness_stats.copy(),
+            avg_lateness_ms=avg_lateness
         )
         
         return result
@@ -393,13 +463,9 @@ class StreamProcessor:
         print(f"  Dataset: {self.dataset_name}")
         print(f"  Data Trust State: {self.data_trust_state.value}")
         print(f"  Initialized: {self.initialized}")
-        print(f"\n  Buffer Status:")
-        print(f"    Main Buffer: {len(self.main_buffer)} / {self.buffer_size}")
-        print(f"    Snapshot Buffer: {len(self.snapshot_buffer)} / {self.snapshot_buffer_size}")
-        print(f"\n  Orderbook:")
-        if self.current_orderbook:
-            ob_size = len(self.current_orderbook.bid_levels) + len(self.current_orderbook.ask_levels)
-            print(f"    Levels: {ob_size} (max: {self.max_orderbook_levels * 2})")
+        print(f"\n  Lateness Config:")
+        print(f"    Allowed: {self.allowed_lateness_ms}ms")
+        print(f"    Degraded threshold: {self.degraded_lateness_ms}ms")
         print(f"\n  Statistics:")
         for key, value in self.stats.items():
             print(f"    {key}: {value:,}")
