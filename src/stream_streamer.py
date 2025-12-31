@@ -88,17 +88,27 @@ class DataFrameStreamer:
                 ...
             ]
         """
-        # is_snapshot=True인 행만 필터
-        snapshots = self.orderbook[self.orderbook.get('is_snapshot', False) == True].copy()
+        # ⭐ 컬럼 존재 확인
+        if 'is_snapshot' not in self.orderbook.columns:
+            print("⚠️ Warning: 'is_snapshot' 컬럼이 없습니다.")
+            return []
+        
+        # ⭐ 올바른 필터링 (DataFrame 인덱싱)
+        snapshots = self.orderbook[self.orderbook['is_snapshot'] == True].copy()
         
         if snapshots.empty:
             print("⚠️ Snapshot이 없습니다.")
             return []
         
+        print(f"✅ Snapshot 발견: {len(snapshots):,} rows")
+        
         # Timestamp별로 그룹화
         snapshot_groups = []
         
-        for ts in snapshots['timestamp'].unique():
+        unique_timestamps = snapshots['timestamp'].unique()
+        print(f"✅ Unique snapshot timestamps: {len(unique_timestamps)}")
+        
+        for ts in unique_timestamps:
             group = snapshots[snapshots['timestamp'] == ts]
             
             bids = []
@@ -120,12 +130,32 @@ class DataFrameStreamer:
                 'bids': bids,
                 'asks': asks
             })
+            
+            print(f"  Snapshot @ {ts}: {len(bids)} bids, {len(asks)} asks")
         
         # local_timestamp 순으로 정렬
         snapshot_groups.sort(key=lambda x: x['local_timestamp'])
         
+        print(f"✅ Snapshot 그룹 생성 완료: {len(snapshot_groups)} groups")
+        
         return snapshot_groups
     
+
+    def _create_orderbook_event(self, row: pd.Series) -> Event:
+        """Orderbook Update Event 생성"""
+        return Event(
+            event_type=EventType.ORDERBOOK,
+            timestamp=int(row['timestamp']),
+            local_timestamp=int(row['local_timestamp']),
+            data={
+                'is_snapshot': bool(row['is_snapshot']),  # ⭐ 명시적 bool 변환
+                'price': float(row['price']),
+                'amount': float(row['amount']),
+                'side': row['side']
+            }
+        )
+
+
     def get_next_event(self) -> Optional[Event]:
         """
         다음 이벤트 가져오기 (시간순)
@@ -149,13 +179,18 @@ class DataFrameStreamer:
         if self.orderbook_idx < len(self.orderbook):
             row = self.orderbook.iloc[self.orderbook_idx]
             
-            # Snapshot이 아닌 것만
-            if not row.get('is_snapshot', False):
+            # ⭐ Snapshot이 아닌 것만 (올바른 체크)
+            if row['is_snapshot'] != True:  # 또는 row['is_snapshot'] == False
                 candidates.append({
                     'type': 'orderbook',
                     'timestamp': row['local_timestamp'],
                     'data': row
                 })
+            else:
+                # Snapshot 행이면 건너뛰기
+                self.orderbook_idx += 1
+                # 재귀 호출하여 다음 이벤트 가져오기
+                return self.get_next_event()
         
         # 3. Trade
         if self.trades_idx < len(self.trades):

@@ -307,32 +307,50 @@ class StreamProcessor:
     def _process_ticker(self, event: Event):
         """Ticker 이벤트 처리 및 Consistency Check"""
         self.stats['ticker_checkpoints'] += 1
-
+        
+        # 변수 초기화
+        consistency_score = 0.0
+        result = None
+        
         # Consistency check
         if not self.current_orderbook:
+            # Orderbook이 아직 없으면
             consistency_score = 0.0
             self.data_trust_state = DataTrustState.UNTRUSTED
         else:
+            # Orderbook이 있으면 consistency check
             result = self.consistency_checker.check_overall_consistency(
-                ticker_data = event.data,
-                orderbook = self.current_orderbook,
-                total_events = self.stats['events_processed'],
-                repairs = self.stats['repairs'],
-                quarantines = self.stats['quarantines']
+                ticker_data=event.data,
+                orderbook=self.current_orderbook,
+                total_events=self.stats['events_processed'],
+                repairs=self.stats['repairs'],
+                quarantines=self.stats['quarantines']
             )
-
-        consistency_score = result['overall_score']
-
-        # State 전환
-        if consistency_score >= self.processor_config.trusted_threshold:
-            self.data_trust_state = DataTrustState.TRUSTED
-        elif consistency_score >= self.processor_config.degraded_threshold:
-            self.data_trust_state = DataTrustState.DEGRADED
-        else:
-            self.data_trust_state = DataTrustState.UNTRUSTED
-
+            
+            consistency_score = result['overall_score']
+            
+            # State 전환
+            if consistency_score >= self.processor_config.trusted_threshold:
+                self.data_trust_state = DataTrustState.TRUSTED
+            elif consistency_score >= self.processor_config.degraded_threshold:
+                self.data_trust_state = DataTrustState.DEGRADED
+            else:
+                self.data_trust_state = DataTrustState.UNTRUSTED
+        
+        # 로그 출력 (일정 간격마다)
         if self.stats['ticker_checkpoints'] % self.processor_config.consistency_log_interval == 0:
-            self._print_consistency_check(event, result)
+            if result is not None:
+                # 정상적인 consistency check 결과가 있을 때
+                self._print_consistency_check(event, result)
+            else:
+                # Orderbook이 없을 때 간단한 로그
+                print(f"\n{'='*60}")
+                print(f"🔔 Ticker Checkpoint #{self.stats['ticker_checkpoints']} at {event.timestamp}")
+                print(f"{'='*60}")
+                print(f"  Data Trust State: {self.data_trust_state.value}")
+                print(f"  Consistency Score: {consistency_score:.2%}")
+                print(f"  Events Processed: {self.stats['events_processed']}")
+                print(f"  ⚠️ Orderbook not initialized yet")
 
         
     def _process_liquidation(self, event: Event):
