@@ -1,106 +1,81 @@
 """
-Defining data types
+Data Types - 시스템에서 사용하는 데이터 구조
 """
 from dataclasses import dataclass
 from typing import Dict, Optional
 from src.enums import EventType
 
+
 @dataclass
 class Event:
-    """Event Data Class"""
+    """이벤트 데이터"""
     event_type: EventType
-    timestamp: int    # microseconds
-    local_timestamp: int
+    timestamp: int          # microseconds (event time)
+    local_timestamp: int    # microseconds (processing time)
     data: Dict
 
 
 @dataclass
 class OrderbookState:
-    """Orderbook State"""
+    """Orderbook 상태"""
     timestamp: int
-    bid_levels: Dict[float, float]    # {price: amount}
+    bid_levels: Dict[float, float]    # {price: quantity}
     ask_levels: Dict[float, float]
-
-    def get_depth(self, side: str, n: int = 10) -> float:
-        """
-        Top N levels의 총 depth
-        
-        Args:
-            side: 'bid' or 'ask'
-            n: level 수
-
-        Returns:
-            총 depth (BTC)
-        """
-        levels = self.bid_levels if side == 'bid' else self.ask_levels
-        sorted_levels = sorted(levels.items(), key=lambda x: x[0], reverse=(side=='bid'))
-        return sum(amount for _, amount in sorted_levels[:n])
-
+    
     def get_best_bid(self) -> Optional[float]:
-        """
-        Best bid price 반환
-        
-        Returns:
-            최고 매수 호가 (가장 높은 bid price) 또는 None
-        """
-        if not self.bid_levels:
-            return None
-        return max(self.bid_levels.keys())
+        """최고 매수 호가"""
+        return max(self.bid_levels.keys()) if self.bid_levels else None
     
     def get_best_ask(self) -> Optional[float]:
-        """
-        Best ask price 반환
-        
-        Returns:
-            최저 매도 호가 (가장 낮은 ask price) 또는 None
-        """
-        if not self.ask_levels:
-            return None
-        return min(self.ask_levels.keys())
+        """최저 매도 호가"""
+        return min(self.ask_levels.keys()) if self.ask_levels else None
     
     def get_mid_price(self) -> Optional[float]:
-        """
-        Mid price 계산
-        
-        Returns:
-            (best_bid + best_ask) / 2 또는 None
-        """
-        best_bid = self.get_best_bid()
-        best_ask = self.get_best_ask()
-        
-        if best_bid is None or best_ask is None:
+        """중간 가격"""
+        bid = self.get_best_bid()
+        ask = self.get_best_ask()
+        if bid is None or ask is None:
             return None
-        
-        return (best_bid + best_ask) / 2
+        return (bid + ask) / 2
     
     def get_spread(self) -> Optional[float]:
-        """
-        Spread 계산
-        
-        Returns:
-            best_ask - best_bid 또는 None
-        """
-        best_bid = self.get_best_bid()
-        best_ask = self.get_best_ask()
-        
-        if best_bid is None or best_ask is None:
+        """스프레드 (절대값)"""
+        bid = self.get_best_bid()
+        ask = self.get_best_ask()
+        if bid is None or ask is None:
             return None
-        
-        return best_ask - best_bid
-
-
-    def clone(self, new_timestamp: int) -> 'OrderbookState':
-        """
-        Orderbook 복사
-
-        Args:
-            new_timestamp: 새 timestamp
-
-        Returns:
-            복사된 OrderbookState
-        """
+        return ask - bid
+    
+    def get_spread_bps(self) -> Optional[float]:
+        """스프레드 (basis points)"""
+        spread = self.get_spread()
+        mid = self.get_mid_price()
+        if spread is None or mid is None or mid == 0:
+            return None
+        return (spread / mid) * 10000
+    
+    def is_crossed(self) -> bool:
+        """Crossed market 여부"""
+        bid = self.get_best_bid()
+        ask = self.get_best_ask()
+        if bid is None or ask is None:
+            return False
+        return bid >= ask
+    
+    def get_depth(self, side: str, n: int = 10) -> float:
+        """Top N levels 총 depth"""
+        levels = self.bid_levels if side == 'bid' else self.ask_levels
+        sorted_levels = sorted(
+            levels.items(), 
+            key=lambda x: x[0], 
+            reverse=(side == 'bid')
+        )
+        return sum(qty for _, qty in sorted_levels[:n])
+    
+    def clone(self, new_timestamp: Optional[int] = None) -> 'OrderbookState':
+        """복사"""
         return OrderbookState(
-            timestamp=new_timestamp,
+            timestamp=new_timestamp or self.timestamp,
             bid_levels=self.bid_levels.copy(),
             ask_levels=self.ask_levels.copy()
         )

@@ -1,132 +1,109 @@
 """
-Consistency Checker - Integrity Uncertainty 측정
+Consistency Checker - 데이터 무결성 검사
 
-"이 trade는 현재 Orderbook 상태에서 발생 가능한 trade인가?"
-
-세 가지 consistency metric:
-1. Spread Validity: Orderbook이 crossed market이 아닌가?
-2. Price-in-Spread: Last price가 mid price 근처인가?
-3. Funding-Imbalance Alignment: Funding과 Imbalance 부호가 일치하는가?
+Orderbook과 Ticker 간의 일관성 검사
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+from src.data_types import OrderbookState
 from src.uncertainty import IntegrityUncertainty
 
 
 class ConsistencyChecker:
     """
-    Consistency Checker
+    데이터 일관성 검사기
     
-    Effective Orderbook이 "서로 모순되지 않는 시장 상태"를 표현하는지 검증
+    Sanitization Policy 판단을 위한 Integrity 정보 생성
     """
     
     def check_integrity(self,
                         ticker_data: Dict,
-                        orderbook: Optional['OrderbookState']) -> IntegrityUncertainty:
+                        orderbook: OrderbookState) -> IntegrityUncertainty:
         """
-        Integrity Uncertainty 측정
+        Integrity 검사 수행
+        
+        Args:
+            ticker_data: {'last_price': float, 'funding_rate': float}
+            orderbook: 현재 호가창 상태
         
         Returns:
-            IntegrityUncertainty with current check results
+            IntegrityUncertainty
         """
         integrity = IntegrityUncertainty()
         
-        # Orderbook이 없으면 모든 체크 실패
-        if orderbook is None or not orderbook.bid_levels or not orderbook.ask_levels:
-            integrity.spread_valid = False
-            integrity.price_in_spread = False
-            integrity.funding_imbalance_aligned = False
-            return integrity
+        # Spread 유효성 검사 (Crossed market 체크)
+        spread_valid, deviation_bps = self._check_spread_validity(orderbook, ticker_data)
+        integrity.spread_valid = spread_valid
+        integrity.price_deviation_bps = deviation_bps
         
-        # 1. Spread Validity (Crossed Market Check)
-        integrity.spread_valid = self._check_spread_valid(orderbook)
+        # Price in spread 검사
+        integrity.price_in_spread = self._check_price_in_spread(
+            ticker_data.get('last_price'),
+            orderbook
+        )
         
-        # 2. Price-in-Spread
-        integrity.price_in_spread = self._check_price_in_spread(ticker_data, orderbook)
-        
-        # 3. Funding-Imbalance Alignment
-        integrity.funding_imbalance_aligned = self._check_funding_imbalance(ticker_data, orderbook)
+        # Funding rate imbalance 검사
+        funding_rate = ticker_data.get('funding_rate')
+        if funding_rate is not None:
+            integrity.funding_imbalance = abs(funding_rate) > 0.001  # 0.1%
         
         return integrity
     
-    
-    def _check_spread_valid(self, orderbook: 'OrderbookState') -> bool:
+    def _check_spread_validity(self, 
+                               orderbook: OrderbookState,
+                               ticker_data: Dict) -> Tuple[bool, float]:
         """
-        Spread Validity: Orderbook이 crossed market이 아닌가?
+        Spread 유효성 및 deviation 계산
         
-        조건: best_bid < best_ask
-        위반 시, Orderbook 구조 자체가 시장 미시구조를 위반한 상태
+        Returns:
+            (spread_valid, deviation_bps)
         """
-        best_bid = max(orderbook.bid_levels.keys())
-        best_ask = min(orderbook.ask_levels.keys())
+        if not orderbook.bid_levels or not orderbook.ask_levels:
+            return True, 0.0
         
-        return best_bid < best_ask
-    
+        best_bid = orderbook.get_best_bid()
+        best_ask = orderbook.get_best_ask()
+        
+        if best_bid is None or best_ask is None:
+            return True, 0.0
+        
+        # Crossed market 체크
+        is_crossed = best_bid >= best_ask
+        
+        # Price deviation 계산
+        last_price = ticker_data.get('last_price', 0)
+        if last_price > 0:
+            if is_crossed:
+                # Crossed market: mid price를 best_bid와 best_ask 평균으로
+                mid_price = (best_bid + best_ask) / 2
+            else:
+                mid_price = orderbook.get_mid_price()
+            
+            if mid_price and mid_price > 0:
+                deviation_bps = abs(last_price - mid_price) / mid_price * 10000
+            else:
+                deviation_bps = float('inf')
+        else:
+            deviation_bps = 0.0
+        
+        return not is_crossed, deviation_bps
     
     def _check_price_in_spread(self,
-                                ticker_data: Dict,
-                                orderbook: 'OrderbookState') -> bool:
+                               last_price: Optional[float],
+                               orderbook: OrderbookState) -> bool:
         """
-        Price-in-Spread: Ticker의 last price가 Orderbook의 mid price 근처인가?
-        
-        이는 Trade/Ticker가 Orderbook reference frame 내에서 설명 가능한지를 검증
+        Last price가 spread 안에 있는지 검사
         """
-        last_price = ticker_data.get('last_price')
-        if last_price is None:
-            return True  # 데이터 없으면 skip
+        if last_price is None or last_price <= 0:
+            return True
         
-        best_bid = max(orderbook.bid_levels.keys())
-        best_ask = min(orderbook.ask_levels.keys())
+        best_bid = orderbook.get_best_bid()
+        best_ask = orderbook.get_best_ask()
         
+        if best_bid is None or best_ask is None:
+            return True
+        
+        # Crossed market이면 무조건 False
         if best_bid >= best_ask:
-            return False  # Crossed market
+            return False
         
-        mid_price = (best_bid + best_ask) / 2
-        spread = best_ask - best_bid
-        
-        # Threshold: spread * 10 또는 10bp 중 큰 값
-        relative_threshold = spread * 10
-        absolute_threshold = mid_price * 0.001  # 10bp
-        threshold = max(relative_threshold, absolute_threshold)
-        
-        deviation = abs(last_price - mid_price)
-        
-        return deviation <= threshold
-    
-    
-    def _check_funding_imbalance(self,
-                                  ticker_data: Dict,
-                                  orderbook: 'OrderbookState') -> bool:
-        """
-        Funding-Imbalance Alignment: Funding rate과 Orderbook imbalance의 부호가 일치하는가?
-        
-        논리:
-        - Funding > 0 → 롱 포지션 많음 → bid pressure 예상 (imbalance > 0)
-        - Funding < 0 → 숏 포지션 많음 → ask pressure 예상 (imbalance < 0)
-        """
-        funding_rate = ticker_data.get('funding_rate')
-        if funding_rate is None:
-            return True  # 데이터 없으면 skip
-        
-        # Orderbook imbalance 계산
-        bid_depth = sum(orderbook.bid_levels.values())
-        ask_depth = sum(orderbook.ask_levels.values())
-        total = bid_depth + ask_depth
-        
-        if total == 0:
-            return True
-        
-        imbalance = (bid_depth - ask_depth) / total
-        
-        # 중립 판정 기준
-        funding_neutral = abs(funding_rate) < 0.0001  # 0.01% 미만
-        imbalance_neutral = abs(imbalance) < 0.1  # 10% 미만
-        
-        # 둘 다 중립이거나 하나만 중립이면 PASS
-        if funding_neutral or imbalance_neutral:
-            return True
-        
-        # 둘 다 강한 신호 - 부호 비교
-        funding_positive = funding_rate > 0
-        imbalance_positive = imbalance > 0
-        
-        return funding_positive == imbalance_positive
+        return best_bid <= last_price <= best_ask

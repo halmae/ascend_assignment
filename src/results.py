@@ -34,6 +34,10 @@ class ProcessingResult:
     decisions_log: List[Dict] = field(default_factory=list)
     state_evaluator_summary: Dict = field(default_factory=dict)
     
+    # === NEW: Integrity-Liquidation 상관분석 ===
+    integrity_events: List[Dict] = field(default_factory=list)
+    liquidation_events: List[Dict] = field(default_factory=list)
+    
     # ====== 계산 속성 ======
     
     @property
@@ -223,6 +227,127 @@ class ProcessingResult:
         with open(summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
         print(f"  ✅ {summary_file}")
+        
+        # === NEW: 4. integrity_events.jsonl ===
+        if self.integrity_events:
+            integrity_file = output_path / "integrity_events.jsonl"
+            with open(integrity_file, 'w') as f:
+                for event in self.integrity_events:
+                    f.write(json.dumps(event) + '\n')
+            print(f"  ✅ {integrity_file} ({len(self.integrity_events)} records)")
+            
+            # Sanitization Policy 분석
+            analysis = self._analyze_sanitization_policy()
+            analysis_file = output_path / "sanitization_analysis.json"
+            with open(analysis_file, 'w') as f:
+                json.dump(analysis, f, indent=2)
+            print(f"  ✅ {analysis_file}")
+            self._print_sanitization_analysis(analysis)
+        
+        # === liquidation_events.jsonl (Liquidation은 여전히 기록하지만 상관분석은 제거) ===
+        if self.liquidation_events:
+            liquidation_file = output_path / "liquidation_events.jsonl"
+            with open(liquidation_file, 'w') as f:
+                for event in self.liquidation_events:
+                    f.write(json.dumps(event) + '\n')
+            print(f"  ✅ {liquidation_file} ({len(self.liquidation_events)} records)")
+    
+    def _analyze_sanitization_policy(self) -> Dict:
+        """
+        Sanitization Policy 분석
+        
+        프로젝트 요구사항:
+        - ACCEPT: 정상 데이터
+        - REPAIR: 수정 가능한 데이터 (price_deviation 작음)
+        - QUARANTINE: 신뢰 불가 데이터 → UNTRUSTED
+        """
+        results = {
+            'total_integrity_events': len(self.integrity_events),
+            'sanitization_distribution': {
+                'ACCEPT': 0,
+                'REPAIR': 0,
+                'QUARANTINE': 0,
+            },
+            'price_deviation_stats': {
+                'repair_deviations': [],
+                'quarantine_deviations': [],
+            },
+        }
+        
+        for ie in self.integrity_events:
+            sanitization = ie.get('sanitization', 'UNKNOWN')
+            deviation = ie.get('price_deviation_bps', 0)
+            
+            if sanitization in results['sanitization_distribution']:
+                results['sanitization_distribution'][sanitization] += 1
+            
+            if sanitization == 'REPAIR':
+                results['price_deviation_stats']['repair_deviations'].append(deviation)
+            elif sanitization == 'QUARANTINE':
+                results['price_deviation_stats']['quarantine_deviations'].append(deviation)
+        
+        # 통계 계산 (별도 딕셔너리로 비율 저장)
+        total = results['total_integrity_events']
+        rates = {}
+        for key in ['ACCEPT', 'REPAIR', 'QUARANTINE']:
+            count = results['sanitization_distribution'][key]
+            rates[f'{key}_pct'] = count / total * 100 if total > 0 else 0
+        
+        # 비율을 별도로 추가
+        results['sanitization_rates'] = rates
+        
+        # Deviation 통계
+        repair_devs = results['price_deviation_stats']['repair_deviations']
+        quarantine_devs = results['price_deviation_stats']['quarantine_deviations']
+        
+        if repair_devs:
+            results['price_deviation_stats']['repair_mean_bps'] = sum(repair_devs) / len(repair_devs)
+            results['price_deviation_stats']['repair_max_bps'] = max(repair_devs)
+        
+        if quarantine_devs:
+            results['price_deviation_stats']['quarantine_mean_bps'] = sum(quarantine_devs) / len(quarantine_devs)
+            results['price_deviation_stats']['quarantine_min_bps'] = min(quarantine_devs)
+        
+        # 리스트는 요약 후 제거 (파일 크기 줄이기)
+        del results['price_deviation_stats']['repair_deviations']
+        del results['price_deviation_stats']['quarantine_deviations']
+        
+        return results
+    
+    def _print_sanitization_analysis(self, analysis: Dict):
+        """Sanitization Policy 분석 결과 출력"""
+        print(f"\n{'='*60}")
+        print(f"📊 Sanitization Policy 분석")
+        print(f"{'='*60}")
+        print(f"  총 Integrity 이벤트: {analysis['total_integrity_events']}")
+        print()
+        
+        dist = analysis['sanitization_distribution']
+        rates = analysis.get('sanitization_rates', {})
+        print(f"  [분류 분포]")
+        print(f"    ACCEPT (정상):     {dist.get('ACCEPT', 0):>6}회 ({rates.get('ACCEPT_pct', 0):>5.1f}%)")
+        print(f"    REPAIR (수정가능): {dist.get('REPAIR', 0):>6}회 ({rates.get('REPAIR_pct', 0):>5.1f}%)")
+        print(f"    QUARANTINE (불가): {dist.get('QUARANTINE', 0):>6}회 ({rates.get('QUARANTINE_pct', 0):>5.1f}%)")
+        
+        stats = analysis['price_deviation_stats']
+        if 'repair_mean_bps' in stats:
+            print(f"\n  [REPAIR Price Deviation]")
+            print(f"    평균: {stats['repair_mean_bps']:.2f} bps")
+            print(f"    최대: {stats['repair_max_bps']:.2f} bps")
+        
+        if 'quarantine_mean_bps' in stats:
+            print(f"\n  [QUARANTINE Price Deviation]")
+            print(f"    평균: {stats['quarantine_mean_bps']:.2f} bps")
+            print(f"    최소: {stats['quarantine_min_bps']:.2f} bps")
+        
+        # 권장사항
+        repair_pct = rates.get('REPAIR_pct', 0)
+        quarantine_pct = rates.get('QUARANTINE_pct', 0)
+        
+        if repair_pct > 50:
+            print(f"\n  💡 REPAIR 비율이 높음 ({repair_pct:.1f}%) → 대부분 수정 가능한 데이터")
+        if quarantine_pct > 30:
+            print(f"\n  ⚠️ QUARANTINE 비율이 높음 ({quarantine_pct:.1f}%) → 데이터 품질 문제 심각")
 
 
 def compare_results(research: ProcessingResult, validation: ProcessingResult):
