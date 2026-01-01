@@ -21,9 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.config import THRESHOLDS, HISTORICAL_CONFIG, print_thresholds, get_thresholds_dict
-from src.stream_processor import StreamProcessor
-from src.data_loader import DataLoader
+from src1.config import THRESHOLDS, HISTORICAL_CONFIG, print_thresholds, get_thresholds_dict
+from src1.stream_processor import StreamProcessor
+from src1.data_loader import DataLoader
 
 
 def process_dataset(data_dir: str, dataset_name: str, output_dir: str) -> dict:

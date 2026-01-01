@@ -1,6 +1,10 @@
+src1/
 output/
 data/
 *.ipynb
 *.png
 *.csv
 src/__pycache__
+run_historical.py
+run_realtime.py
+analyze_spread_liquidation.py

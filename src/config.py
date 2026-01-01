@@ -7,11 +7,13 @@ Single Decision Engine 원칙:
 - 이 파일의 값을 변경하면 양쪽 모두에 자동 적용
 ================================================================================
 
-사용법:
-    from src.config import THRESHOLDS, HISTORICAL_CONFIG, REALTIME_CONFIG
-    
-    # 파라미터 변경 시뮬레이션
-    THRESHOLDS.liquidation_cooldown_ms = 3000  # 5000 → 3000으로 변경
+개선사항 (v2):
+1. Time Alignment Policy (과제 6.2) 추가
+2. Sanitization Policy 강화 (음수 latency, imbalance-funding 불일치)
+3. Stability를 z-score 기반으로 변경
+4. Liquidation cooldown 제거 (→ 추후 Orderbook Health로 대체)
+5. Spread 별도 파라미터 제거 (→ Stability에 통합)
+================================================================================
 """
 from dataclasses import dataclass, field
 from typing import Optional
@@ -26,23 +28,48 @@ class Thresholds:
     """
     Decision Engine 핵심 임계값
     
-    이 값들을 변경하면 Historical/Realtime 모두에 적용됨!
-    
     구조:
+    ├── Time Alignment Policy (과제 6.2)
+    │   ├── allowed_lateness
+    │   ├── buffer
+    │   └── window / watermark
+    │
     ├── Data Trust (데이터 신뢰도)
     │   ├── Freshness: 데이터 신선도
-    │   └── Integrity: 데이터 무결성 (Sanitization)
+    │   └── Integrity: Sanitization Policy (과제 6.3)
     │
     └── Hypothesis Validity (가설 유효성)
-        ├── Stability: Orderbook 안정성
-        ├── Liquidation: 청산 후 쿨다운
-        └── Spread: 스프레드 범위
+        └── Stability: "이 trade가 현재 시장에서 발생 가능한가?"
+    
+    ※ Liquidation cooldown 제거 → 추후 Orderbook Health로 대체
+    ※ Spread 별도 파라미터 제거 → Stability에 통합
     """
+    
+    # =========================================================================
+    # TIME ALIGNMENT POLICY (과제 6.2)
+    # =========================================================================
+    # event-time vs processing-time 정렬 정책
+    
+    # Allowed Lateness: 이 값 초과하면 "late" 이벤트
+    # late 이벤트는 처리하되, freshness 계산에 페널티
+    allowed_lateness_ms: float = 100.0
+    
+    # Buffer: out-of-order 이벤트 재정렬 대기 시간
+    # 이 시간 내에 도착한 이벤트는 순서 재정렬
+    buffer_duration_ms: float = 50.0
+    
+    # Window: 집계 윈도우 크기
+    # Freshness, Integrity 등 계산 시 사용
+    window_size_ms: float = 1000.0
+    
+    # Watermark: "이 시점 이전 이벤트는 더 이상 안 옴" 기준
+    # watermark = max_event_time - watermark_delay
+    # watermark 이전 이벤트가 도착하면 → QUARANTINE
+    watermark_delay_ms: float = 200.0
     
     # =========================================================================
     # DATA TRUST - Freshness (데이터 신선도)
     # =========================================================================
-    # Latency 기반 신뢰도 판단
     
     # TRUSTED: avg_latency <= 이 값
     freshness_trusted_latency_ms: float = 20.0
@@ -56,61 +83,74 @@ class Thresholds:
     # DEGRADED: stale_ratio <= 이 값 (초과하면 UNTRUSTED)
     freshness_degraded_stale_ratio: float = 0.15
     
-    # Stale 판단 기준 (이 값 초과하면 stale로 간주)
-    stale_threshold_ms: float = 100.0
+    # =========================================================================
+    # DATA TRUST - Integrity / Sanitization Policy (과제 6.3)
+    # =========================================================================
+    # 
+    # Sanitization 분류:
+    #   ACCEPT: 정상 데이터
+    #   REPAIR: 수정 가능한 데이터 (minor issue)
+    #   QUARANTINE: 신뢰 불가 데이터 → UNTRUSTED
+    #
+    # QUARANTINE 조건:
+    #   1. 음수 latency (시간 역전)
+    #   2. Watermark 이전 이벤트
+    #   3. Crossed market + high deviation
+    #   4. Imbalance-Funding 방향 불일치 (심각한 경우)
+    # =========================================================================
     
-    # =========================================================================
-    # DATA TRUST - Integrity (Sanitization Policy)
-    # =========================================================================
     # Crossed market 시 REPAIR vs QUARANTINE 판단
-    
-    # REPAIR: price_deviation <= 이 값 (bps)
-    # QUARANTINE: price_deviation > 이 값 → UNTRUSTED
+    # deviation > 이 값 (bps) → QUARANTINE
     integrity_repair_threshold_bps: float = 5.0
     
-    # 보조 지표: 윈도우 내 failure rate
-    integrity_trusted_failure_rate: float = 0.02
-    integrity_degraded_failure_rate: float = 0.10
+    # Imbalance-Funding 불일치 체크
+    # |imbalance| > 이 값 AND sign(imbalance) != sign(funding_rate) → 의심
+    imbalance_threshold: float = 0.3
+    
+    # Funding rate 유의미 판단 기준
+    funding_rate_significant: float = 0.0001  # 0.01%
+    
+    # Imbalance-Funding 불일치 시 QUARANTINE 할지 REPAIR 할지
+    # True면 QUARANTINE, False면 REPAIR (경고만)
+    imbalance_funding_strict: bool = False
     
     # =========================================================================
-    # HYPOTHESIS - Stability (Orderbook 안정성)
+    # HYPOTHESIS - Stability
     # =========================================================================
-    # Spread volatility (CV) 기반 판단
-    
-    # VALID: spread_volatility <= 이 값
-    stability_valid_volatility: float = 0.05
-    
-    # WEAKENING: spread_volatility <= 이 값 (초과하면 INVALID)
-    stability_weakening_volatility: float = 0.15
-    
+    # 핵심 질문: "이 trade가 현재 시장에서 발생 가능한가?"
+    #
+    # Spread deviation을 z-score로 측정
+    # z = (current_spread - normal_mean) / normal_std
+    #
+    # ※ normal_mean, normal_std는 Research에서 calibration 필요
     # =========================================================================
-    # HYPOTHESIS - Liquidation Cooldown
-    # =========================================================================
-    # 대규모 청산 후 안정화 대기 시간
     
-    # VALID: time_since_liquidation >= 이 값 (ms)
-    liquidation_cooldown_ms: float = 5000.0
+    # VALID: z-score <= 이 값
+    stability_valid_zscore: float = 2.0
     
-    # WEAKENING: time_since_liquidation >= 이 값 (ms)
-    liquidation_weakening_ms: float = 2000.0
+    # WEAKENING: z-score <= 이 값 (초과하면 INVALID)
+    stability_weakening_zscore: float = 3.0
     
     # =========================================================================
-    # HYPOTHESIS - Spread
+    # CALIBRATION VALUES (Research에서 학습)
     # =========================================================================
-    # Orderbook spread 범위 판단
+    # 이 값들은 Research 데이터 분석 후 설정
+    # 기본값은 placeholder
     
-    # VALID: spread <= 이 값 (bps)
-    spread_valid_bps: float = 10.0
+    # 정상 상태 spread 분포 (bps)
+    normal_spread_mean_bps: float = 1.0   # Research에서 계산
+    normal_spread_std_bps: float = 0.5    # Research에서 계산
     
-    # WEAKENING: spread <= 이 값 (초과하면 INVALID)
-    spread_weakening_bps: float = 30.0
+    # 정상 상태 depth (BTC)
+    normal_bid_depth_btc: float = 100.0   # Research에서 계산
+    normal_ask_depth_btc: float = 100.0   # Research에서 계산
     
     # =========================================================================
-    # 버퍼/윈도우 크기
+    # 버퍼/윈도우 크기 (샘플 수)
     # =========================================================================
-    latency_window_size: int = 1000
-    spread_history_size: int = 100
-    integrity_history_size: int = 100
+    latency_window_size: int = 1000       # Freshness 계산용
+    spread_history_size: int = 100        # Stability 계산용
+    integrity_history_size: int = 100     # Integrity failure rate 계산용
 
 
 # 전역 인스턴스 (이것을 import해서 사용)
@@ -125,7 +165,6 @@ THRESHOLDS = Thresholds()
 class HistoricalConfig:
     """Phase 1: Historical Validation 설정"""
     
-    # 데이터 경로 (기본값)
     research_dir: str = "./data/research"
     validation_dir: str = "./data/validation"
     output_dir: str = "./output"
@@ -136,7 +175,6 @@ class HistoricalConfig:
     ticker_chunk_size: int = 20_000
     liquidation_chunk_size: int = 5_000
     
-    # 로깅 간격
     log_interval: int = 500_000
 
 
@@ -151,19 +189,15 @@ HISTORICAL_CONFIG = HistoricalConfig()
 class RealtimeConfig:
     """Phase 2: Realtime Validation 설정"""
     
-    # WebSocket
     symbol: str = "btcusdt"
     websocket_url: str = "wss://fstream.binance.com"
     
-    # 실행
     duration_sec: int = 60
     output_dir: str = "./output/realtime"
     
-    # 로깅 간격
     log_interval: int = 100
     
     def get_stream_uri(self) -> str:
-        """Combined Stream URI"""
         streams = [
             f"{self.symbol}@trade",
             f"{self.symbol}@depth@100ms",
@@ -184,28 +218,34 @@ def print_thresholds():
     """현재 임계값 출력"""
     t = THRESHOLDS
     print("=" * 70)
-    print("📋 Current Thresholds (config.py)")
+    print("📋 Current Thresholds (config.py v2)")
     print("=" * 70)
+    
+    print("\n[Time Alignment Policy]")
+    print(f"  allowed_lateness_ms:     {t.allowed_lateness_ms}")
+    print(f"  buffer_duration_ms:      {t.buffer_duration_ms}")
+    print(f"  window_size_ms:          {t.window_size_ms}")
+    print(f"  watermark_delay_ms:      {t.watermark_delay_ms}")
     
     print("\n[Data Trust - Freshness]")
     print(f"  trusted_latency_ms:      {t.freshness_trusted_latency_ms}")
     print(f"  degraded_latency_ms:     {t.freshness_degraded_latency_ms}")
-    print(f"  stale_threshold_ms:      {t.stale_threshold_ms}")
+    print(f"  trusted_stale_ratio:     {t.freshness_trusted_stale_ratio}")
+    print(f"  degraded_stale_ratio:    {t.freshness_degraded_stale_ratio}")
     
-    print("\n[Data Trust - Integrity (Sanitization)]")
+    print("\n[Data Trust - Integrity/Sanitization]")
     print(f"  repair_threshold_bps:    {t.integrity_repair_threshold_bps}")
+    print(f"  imbalance_threshold:     {t.imbalance_threshold}")
+    print(f"  funding_rate_significant:{t.funding_rate_significant}")
+    print(f"  imbalance_funding_strict:{t.imbalance_funding_strict}")
     
-    print("\n[Hypothesis - Stability]")
-    print(f"  valid_volatility:        {t.stability_valid_volatility}")
-    print(f"  weakening_volatility:    {t.stability_weakening_volatility}")
+    print("\n[Hypothesis - Stability (z-score based)]")
+    print(f"  valid_zscore:            {t.stability_valid_zscore}")
+    print(f"  weakening_zscore:        {t.stability_weakening_zscore}")
     
-    print("\n[Hypothesis - Liquidation]")
-    print(f"  cooldown_ms:             {t.liquidation_cooldown_ms}")
-    print(f"  weakening_ms:            {t.liquidation_weakening_ms}")
-    
-    print("\n[Hypothesis - Spread]")
-    print(f"  valid_bps:               {t.spread_valid_bps}")
-    print(f"  weakening_bps:           {t.spread_weakening_bps}")
+    print("\n[Calibration Values (from Research)]")
+    print(f"  normal_spread_mean_bps:  {t.normal_spread_mean_bps}")
+    print(f"  normal_spread_std_bps:   {t.normal_spread_std_bps}")
     
     print("=" * 70)
 
@@ -214,27 +254,52 @@ def get_thresholds_dict() -> dict:
     """임계값을 딕셔너리로 반환 (JSON 저장용)"""
     t = THRESHOLDS
     return {
+        'time_alignment': {
+            'allowed_lateness_ms': t.allowed_lateness_ms,
+            'buffer_duration_ms': t.buffer_duration_ms,
+            'window_size_ms': t.window_size_ms,
+            'watermark_delay_ms': t.watermark_delay_ms,
+        },
         'freshness': {
             'trusted_latency_ms': t.freshness_trusted_latency_ms,
             'degraded_latency_ms': t.freshness_degraded_latency_ms,
-            'stale_threshold_ms': t.stale_threshold_ms,
+            'trusted_stale_ratio': t.freshness_trusted_stale_ratio,
+            'degraded_stale_ratio': t.freshness_degraded_stale_ratio,
         },
         'integrity': {
             'repair_threshold_bps': t.integrity_repair_threshold_bps,
+            'imbalance_threshold': t.imbalance_threshold,
+            'funding_rate_significant': t.funding_rate_significant,
         },
         'stability': {
-            'valid_volatility': t.stability_valid_volatility,
-            'weakening_volatility': t.stability_weakening_volatility,
-        },
-        'liquidation': {
-            'cooldown_ms': t.liquidation_cooldown_ms,
-            'weakening_ms': t.liquidation_weakening_ms,
-        },
-        'spread': {
-            'valid_bps': t.spread_valid_bps,
-            'weakening_bps': t.spread_weakening_bps,
+            'valid_zscore': t.stability_valid_zscore,
+            'weakening_zscore': t.stability_weakening_zscore,
+            'normal_spread_mean_bps': t.normal_spread_mean_bps,
+            'normal_spread_std_bps': t.normal_spread_std_bps,
         },
     }
+
+
+def update_calibration(spread_mean: float, spread_std: float, 
+                       bid_depth: float = None, ask_depth: float = None):
+    """
+    Research 데이터에서 학습한 calibration 값 업데이트
+    
+    Usage:
+        # Research 분석 후
+        update_calibration(spread_mean=1.2, spread_std=0.4)
+    """
+    THRESHOLDS.normal_spread_mean_bps = spread_mean
+    THRESHOLDS.normal_spread_std_bps = spread_std
+    
+    if bid_depth is not None:
+        THRESHOLDS.normal_bid_depth_btc = bid_depth
+    if ask_depth is not None:
+        THRESHOLDS.normal_ask_depth_btc = ask_depth
+    
+    print(f"✅ Calibration updated:")
+    print(f"   spread_mean_bps: {spread_mean}")
+    print(f"   spread_std_bps:  {spread_std}")
 
 
 # =============================================================================
@@ -242,8 +307,3 @@ def get_thresholds_dict() -> dict:
 # =============================================================================
 if __name__ == "__main__":
     print_thresholds()
-    print("\n[Historical Config]")
-    print(f"  output_dir: {HISTORICAL_CONFIG.output_dir}")
-    print("\n[Realtime Config]")
-    print(f"  symbol: {REALTIME_CONFIG.symbol}")
-    print(f"  duration_sec: {REALTIME_CONFIG.duration_sec}")

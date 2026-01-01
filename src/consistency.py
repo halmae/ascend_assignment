@@ -1,19 +1,27 @@
 """
-Consistency Checker - 데이터 무결성 검사
+Consistency Checker - 데이터 무결성 검사 (v2)
 
-Orderbook과 Ticker 간의 일관성 검사
+================================================================================
+변경사항:
+1. Imbalance-Funding 불일치 체크 추가
+2. Orderbook depth 계산 추가
+================================================================================
 """
 from typing import Dict, Optional, Tuple
+from src.config import THRESHOLDS
 from src.data_types import OrderbookState
 from src.uncertainty import IntegrityUncertainty
 
 
 class ConsistencyChecker:
     """
-    데이터 일관성 검사기
+    데이터 일관성 검사기 (v2)
     
     Sanitization Policy 판단을 위한 Integrity 정보 생성
     """
+    
+    def __init__(self):
+        self.th = THRESHOLDS
     
     def check_integrity(self,
                         ticker_data: Dict,
@@ -21,30 +29,41 @@ class ConsistencyChecker:
         """
         Integrity 검사 수행
         
-        Args:
-            ticker_data: {'last_price': float, 'funding_rate': float}
-            orderbook: 현재 호가창 상태
-        
-        Returns:
-            IntegrityUncertainty
+        체크 항목:
+        1. Spread 유효성 (Crossed market)
+        2. Price in spread
+        3. Price deviation
+        4. Imbalance-Funding 불일치 (새로 추가)
         """
         integrity = IntegrityUncertainty()
         
-        # Spread 유효성 검사 (Crossed market 체크)
+        # 1. Spread 유효성 검사
         spread_valid, deviation_bps = self._check_spread_validity(orderbook, ticker_data)
         integrity.spread_valid = spread_valid
         integrity.price_deviation_bps = deviation_bps
         
-        # Price in spread 검사
+        # 2. Price in spread 검사
         integrity.price_in_spread = self._check_price_in_spread(
             ticker_data.get('last_price'),
             orderbook
         )
         
-        # Funding rate imbalance 검사
+        # 3. Funding rate 저장
         funding_rate = ticker_data.get('funding_rate')
+        integrity.funding_rate = funding_rate
+        
+        # 4. Orderbook imbalance 계산
+        imbalance = self._calculate_imbalance(orderbook)
+        integrity.orderbook_imbalance = imbalance
+        
+        # 5. Imbalance-Funding 불일치 체크
+        integrity.imbalance_funding_mismatch = self._check_imbalance_funding_mismatch(
+            imbalance, funding_rate
+        )
+        
+        # 6. Funding imbalance (기존 호환)
         if funding_rate is not None:
-            integrity.funding_imbalance = abs(funding_rate) > 0.001  # 0.1%
+            integrity.funding_imbalance = abs(funding_rate) > 0.001
         
         return integrity
     
@@ -73,7 +92,6 @@ class ConsistencyChecker:
         last_price = ticker_data.get('last_price', 0)
         if last_price > 0:
             if is_crossed:
-                # Crossed market: mid price를 best_bid와 best_ask 평균으로
                 mid_price = (best_bid + best_ask) / 2
             else:
                 mid_price = orderbook.get_mid_price()
@@ -107,3 +125,60 @@ class ConsistencyChecker:
             return False
         
         return best_bid <= last_price <= best_ask
+    
+    def _calculate_imbalance(self, orderbook: OrderbookState) -> float:
+        """
+        Orderbook imbalance 계산
+        
+        imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
+        
+        Returns:
+            -1 ~ +1 (양수면 bid 우세, 음수면 ask 우세)
+        """
+        if not orderbook.bid_levels or not orderbook.ask_levels:
+            return 0.0
+        
+        bid_depth = sum(orderbook.bid_levels.values())
+        ask_depth = sum(orderbook.ask_levels.values())
+        
+        total_depth = bid_depth + ask_depth
+        if total_depth == 0:
+            return 0.0
+        
+        return (bid_depth - ask_depth) / total_depth
+    
+    def _check_imbalance_funding_mismatch(self,
+                                          imbalance: float,
+                                          funding_rate: Optional[float]) -> bool:
+        """
+        Imbalance-Funding 불일치 체크
+        
+        논리:
+        - imbalance > 0 (bid 우세) → 매수 압력 → funding_rate 양수 예상
+        - imbalance < 0 (ask 우세) → 매도 압력 → funding_rate 음수 예상
+        - 방향이 반대면 불일치
+        
+        조건:
+        - |imbalance| > imbalance_threshold
+        - |funding_rate| > funding_rate_significant
+        - sign(imbalance) != sign(funding_rate)
+        
+        Returns:
+            True if mismatch detected
+        """
+        if funding_rate is None:
+            return False
+        
+        # 임계값 이하면 의미 없음
+        if abs(imbalance) <= self.th.imbalance_threshold:
+            return False
+        
+        if abs(funding_rate) <= self.th.funding_rate_significant:
+            return False
+        
+        # 부호 비교
+        imbalance_sign = 1 if imbalance > 0 else -1
+        funding_sign = 1 if funding_rate > 0 else -1
+        
+        # 불일치 = 부호가 다름
+        return imbalance_sign != funding_sign
