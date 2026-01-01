@@ -115,42 +115,51 @@ class Thresholds:
     imbalance_funding_strict: bool = False
     
     # =========================================================================
-    # HYPOTHESIS - Stability
+    # HYPOTHESIS - Stability (AR(1) 기반 Predictability)
     # =========================================================================
-    # 핵심 질문: "이 trade가 현재 시장에서 발생 가능한가?"
+    # 핵심 질문: "spread dynamics가 예측 가능한가?"
     #
-    # Spread deviation을 z-score로 측정
-    # z = (current_spread - normal_mean) / normal_std
+    # AR(1) 모델: s_t = φ * s_{t-1} + ε_t
+    # fit_quality = 1 - (residual_variance / total_variance)
     #
-    # ※ normal_mean, normal_std는 Research에서 calibration 필요
+    # 판단 로직:
+    # - fit_quality = None (unknown): 샘플 부족 → VALID (보수적)
+    # - fit_quality >= 0.6 AND forecast_error <= 2.5σ → VALID
+    # - fit_quality <= 0.25 OR forecast_error >= 4σ → INVALID
+    # - 그 외 → WEAKENING (gray zone)
+    #
+    # ※ φ는 단독 조건으로 사용 안 함 (fit_quality와 조합만)
     # =========================================================================
     
-    # VALID: z-score <= 이 값
-    stability_valid_zscore: float = 2.0
+    # 최소 샘플 수 (미만이면 unknown → VALID 처리)
+    ar1_min_samples: int = 20
     
-    # WEAKENING: z-score <= 이 값 (초과하면 INVALID)
-    stability_weakening_zscore: float = 3.0
+    # VALID: fit_quality >= 이 값 AND forecast_error <= 2.5σ
+    ar1_fit_quality_valid: float = 0.6
     
-    # =========================================================================
-    # CALIBRATION VALUES (Research에서 학습)
-    # =========================================================================
-    # 이 값들은 Research 데이터 분석 후 설정
-    # 기본값은 placeholder
+    # INVALID: fit_quality <= 이 값 OR forecast_error >= 4σ
+    ar1_fit_quality_invalid: float = 0.25
     
-    # 정상 상태 spread 분포 (bps)
-    normal_spread_mean_bps: float = 1.0   # Research에서 계산
-    normal_spread_std_bps: float = 0.5    # Research에서 계산
-    
-    # 정상 상태 depth (BTC)
-    normal_bid_depth_btc: float = 100.0   # Research에서 계산
-    normal_ask_depth_btc: float = 100.0   # Research에서 계산
+    # Forecast error 배수
+    ar1_forecast_error_valid_mult: float = 2.5   # ≤ 2.5σ → stable
+    ar1_forecast_error_invalid_mult: float = 4.0  # ≥ 4σ → exploding
     
     # =========================================================================
     # 버퍼/윈도우 크기 (샘플 수)
     # =========================================================================
     latency_window_size: int = 1000       # Freshness 계산용
-    spread_history_size: int = 100        # Stability 계산용
+    spread_history_size: int = 100        # AR(1) window size
     integrity_history_size: int = 100     # Integrity failure rate 계산용
+    
+    # =========================================================================
+    # LEGACY (AR(1) 도입으로 더 이상 사용 안 함, 호환성 유지)
+    # =========================================================================
+    stability_valid_zscore: float = 2.0
+    stability_weakening_zscore: float = 3.0
+    normal_spread_mean_bps: float = 1.0
+    normal_spread_std_bps: float = 0.5
+    normal_bid_depth_btc: float = 100.0
+    normal_ask_depth_btc: float = 100.0
 
 
 # 전역 인스턴스 (이것을 import해서 사용)
@@ -239,13 +248,12 @@ def print_thresholds():
     print(f"  funding_rate_significant:{t.funding_rate_significant}")
     print(f"  imbalance_funding_strict:{t.imbalance_funding_strict}")
     
-    print("\n[Hypothesis - Stability (z-score based)]")
-    print(f"  valid_zscore:            {t.stability_valid_zscore}")
-    print(f"  weakening_zscore:        {t.stability_weakening_zscore}")
-    
-    print("\n[Calibration Values (from Research)]")
-    print(f"  normal_spread_mean_bps:  {t.normal_spread_mean_bps}")
-    print(f"  normal_spread_std_bps:   {t.normal_spread_std_bps}")
+    print("\n[Hypothesis - AR(1) Stability]")
+    print(f"  ar1_min_samples:         {t.ar1_min_samples}")
+    print(f"  ar1_fit_quality_valid:   {t.ar1_fit_quality_valid}")
+    print(f"  ar1_fit_quality_invalid: {t.ar1_fit_quality_invalid}")
+    print(f"  ar1_forecast_error_valid:{t.ar1_forecast_error_valid_mult}σ")
+    print(f"  ar1_forecast_error_invalid:{t.ar1_forecast_error_invalid_mult}σ")
     
     print("=" * 70)
 
@@ -271,11 +279,12 @@ def get_thresholds_dict() -> dict:
             'imbalance_threshold': t.imbalance_threshold,
             'funding_rate_significant': t.funding_rate_significant,
         },
-        'stability': {
-            'valid_zscore': t.stability_valid_zscore,
-            'weakening_zscore': t.stability_weakening_zscore,
-            'normal_spread_mean_bps': t.normal_spread_mean_bps,
-            'normal_spread_std_bps': t.normal_spread_std_bps,
+        'ar1_stability': {
+            'min_samples': t.ar1_min_samples,
+            'fit_quality_valid': t.ar1_fit_quality_valid,
+            'fit_quality_invalid': t.ar1_fit_quality_invalid,
+            'forecast_error_valid_mult': t.ar1_forecast_error_valid_mult,
+            'forecast_error_invalid_mult': t.ar1_forecast_error_invalid_mult,
         },
     }
 

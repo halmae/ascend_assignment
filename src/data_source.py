@@ -1,11 +1,11 @@
 """
-Data Source - Historical/Realtime 통합 데이터 소스 (최적화 버전)
+Data Source - Historical/Realtime 통합 데이터 소스 (최적화 v3)
 
 ================================================================================
-v2 최적화:
-- Orderbook을 row 단위가 아닌 timestamp 단위로 그룹화하여 처리
-- iloc 슬라이싱 대신 인덱스 기반 접근
-- 메모리 효율성 개선
+최적화:
+- iterrows() 제거 → 벡터화 처리
+- groupby로 timestamp별 배치 처리
+- 메모리 효율적 청크 처리
 ================================================================================
 """
 import asyncio
@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional, Dict, AsyncIterator, List, Tuple
+from typing import Iterator, Optional, Dict, AsyncIterator, List
 from dataclasses import dataclass
 import heapq
 
@@ -60,12 +60,12 @@ class DataSource(ABC):
 
 class HistoricalDataSource(DataSource):
     """
-    Historical 데이터 소스 (최적화 버전)
+    Historical 데이터 소스 (최적화 v3)
     
-    최적화:
-    1. Orderbook을 timestamp별로 미리 그룹화
-    2. 청크 단위로 처리하여 메모리 효율성 확보
-    3. heapq를 사용한 효율적인 병합 정렬
+    핵심 최적화:
+    1. Orderbook: groupby + 벡터화 (iterrows 제거)
+    2. 청크 단위 처리
+    3. heapq 병합 정렬
     """
     
     def __init__(self, data_dir: str):
@@ -88,33 +88,24 @@ class HistoricalDataSource(DataSource):
         return files
     
     def get_events(self) -> Iterator[Event]:
-        """
-        CSV에서 이벤트 읽기 (최적화된 버전)
-        
-        전략: 각 파일을 독립적으로 처리하고, timestamp 기준으로 병합
-        """
+        """이벤트 스트리밍 (병합 정렬)"""
         self._is_running = True
-        
-        print(f"📂 데이터 로딩 시작...")
-        print(f"   Files: {list(self.files.keys())}")
         
         # 각 스트림의 이벤트 제너레이터
         generators = {}
         
         if 'orderbook' in self.files:
-            generators['orderbook'] = self._stream_orderbook_events()
+            generators['orderbook'] = self._stream_orderbook_fast()
         if 'trades' in self.files:
-            generators['trades'] = self._stream_csv_events('trades', EventType.TRADE)
+            generators['trades'] = self._stream_trades_fast()
         if 'ticker' in self.files:
-            generators['ticker'] = self._stream_csv_events('ticker', EventType.TICKER)
+            generators['ticker'] = self._stream_ticker_fast()
         if 'liquidations' in self.files:
-            generators['liquidations'] = self._stream_csv_events('liquidations', EventType.LIQUIDATION)
+            generators['liquidations'] = self._stream_liquidations_fast()
         
-        # heapq를 사용한 병합 정렬
-        # (timestamp, stream_name, event)
+        # heapq 병합 정렬
         heap = []
         
-        # 각 스트림에서 첫 이벤트 가져오기
         for name, gen in generators.items():
             try:
                 event = next(gen)
@@ -122,9 +113,6 @@ class HistoricalDataSource(DataSource):
             except StopIteration:
                 pass
         
-        print(f"   ✅ 스트림 초기화 완료. 병합 시작...")
-        
-        # 병합 정렬로 이벤트 순서대로 반환
         while heap and self._is_running:
             ts, name, event, gen = heapq.heappop(heap)
             
@@ -133,23 +121,22 @@ class HistoricalDataSource(DataSource):
             
             yield event
             
-            # 해당 스트림에서 다음 이벤트 가져오기
             try:
                 next_event = next(gen)
                 heapq.heappush(heap, (next_event.local_timestamp, name, next_event, gen))
             except StopIteration:
                 pass
     
-    def _stream_orderbook_events(self) -> Iterator[Event]:
+    def _stream_orderbook_fast(self) -> Iterator[Event]:
         """
-        Orderbook CSV 스트리밍 (timestamp별 그룹화)
+        Orderbook 빠른 스트리밍 (벡터화)
         
-        CSV 형식: 각 row가 하나의 price level
-        → 같은 timestamp의 row들을 모아서 하나의 이벤트로
+        전략: groupby(timestamp)로 배치 처리
         """
         path = self.files['orderbook']
-        chunk_size = 500_000  # 50만 rows씩
+        chunk_size = 1_000_000  # 100만 rows
         
+        # 청크 간 pending 데이터
         pending_ts = None
         pending_local_ts = None
         pending_is_snapshot = False
@@ -157,21 +144,20 @@ class HistoricalDataSource(DataSource):
         pending_asks = []
         
         for chunk in pd.read_csv(path, chunksize=chunk_size):
-            # timestamp로 정렬
-            chunk = chunk.sort_values('local_timestamp')
+            # 필요한 컬럼만 사용
+            chunk = chunk[['timestamp', 'local_timestamp', 'side', 'price', 'amount', 'is_snapshot']].copy()
             
-            for _, row in chunk.iterrows():
-                ts = int(row.get('timestamp', 0))
-                local_ts = int(row.get('local_timestamp', ts))
-                is_snapshot = row.get('is_snapshot', False)
+            # timestamp별 그룹화
+            grouped = chunk.groupby('timestamp', sort=True)
+            
+            for ts, group in grouped:
+                ts = int(ts)
+                local_ts = int(group['local_timestamp'].iloc[0])
+                is_snapshot = group['is_snapshot'].iloc[0]
                 if isinstance(is_snapshot, str):
                     is_snapshot = is_snapshot.lower() == 'true'
                 
-                side = str(row.get('side', '')).lower()
-                price = float(row.get('price', 0))
-                amount = float(row.get('amount', 0))
-                
-                # 새로운 timestamp면 이전 것을 yield
+                # 이전 pending flush
                 if pending_ts is not None and pending_ts != ts:
                     if pending_bids or pending_asks:
                         event_type = EventType.SNAPSHOT if pending_is_snapshot else EventType.ORDERBOOK
@@ -181,19 +167,21 @@ class HistoricalDataSource(DataSource):
                             local_timestamp=pending_local_ts,
                             data={'bids': pending_bids, 'asks': pending_asks}
                         )
-                    
                     pending_bids = []
                     pending_asks = []
                 
-                # 현재 row 추가
+                # 벡터화된 bid/ask 분리
+                bids_mask = group['side'] == 'bid'
+                asks_mask = group['side'] == 'ask'
+                
+                bids_data = group.loc[bids_mask, ['price', 'amount']].values.tolist()
+                asks_data = group.loc[asks_mask, ['price', 'amount']].values.tolist()
+                
                 pending_ts = ts
                 pending_local_ts = local_ts
                 pending_is_snapshot = is_snapshot
-                
-                if side == 'bid':
-                    pending_bids.append([price, amount])
-                elif side == 'ask':
-                    pending_asks.append([price, amount])
+                pending_bids = bids_data
+                pending_asks = asks_data
         
         # 마지막 pending flush
         if pending_ts is not None and (pending_bids or pending_asks):
@@ -205,53 +193,83 @@ class HistoricalDataSource(DataSource):
                 data={'bids': pending_bids, 'asks': pending_asks}
             )
     
-    def _stream_csv_events(self, name: str, event_type: EventType) -> Iterator[Event]:
-        """일반 CSV 스트리밍 (trades, ticker, liquidations)"""
-        path = self.files[name]
+    def _stream_trades_fast(self) -> Iterator[Event]:
+        """Trades 빠른 스트리밍"""
+        path = self.files['trades']
+        chunk_size = 500_000
         
-        chunk_sizes = {
-            'trades': 100_000,
-            'ticker': 50_000,
-            'liquidations': 10_000,
-        }
-        chunk_size = chunk_sizes.get(name, 50_000)
+        for chunk in pd.read_csv(path, chunksize=chunk_size):
+            # local_timestamp로 정렬
+            chunk = chunk.sort_values('local_timestamp')
+            
+            # 벡터화된 데이터 추출
+            timestamps = chunk['timestamp'].values
+            local_timestamps = chunk['local_timestamp'].values
+            prices = chunk['price'].values
+            amounts = chunk['amount'].values
+            sides = chunk['side'].values if 'side' in chunk.columns else ['unknown'] * len(chunk)
+            
+            for i in range(len(chunk)):
+                yield Event(
+                    event_type=EventType.TRADE,
+                    timestamp=int(timestamps[i]),
+                    local_timestamp=int(local_timestamps[i]),
+                    data={
+                        'price': float(prices[i]),
+                        'quantity': float(amounts[i]),
+                        'side': sides[i] if isinstance(sides, np.ndarray) else sides,
+                    }
+                )
+    
+    def _stream_ticker_fast(self) -> Iterator[Event]:
+        """Ticker 빠른 스트리밍"""
+        path = self.files['ticker']
+        chunk_size = 100_000
         
         for chunk in pd.read_csv(path, chunksize=chunk_size):
             chunk = chunk.sort_values('local_timestamp')
             
-            for _, row in chunk.iterrows():
-                ts = int(row.get('timestamp', 0))
-                local_ts = int(row.get('local_timestamp', ts))
-                
-                data = self._extract_data(name, row)
-                
+            timestamps = chunk['timestamp'].values
+            local_timestamps = chunk['local_timestamp'].values
+            last_prices = chunk['last_price'].values
+            funding_rates = chunk['funding_rate'].values if 'funding_rate' in chunk.columns else [None] * len(chunk)
+            
+            for i in range(len(chunk)):
                 yield Event(
-                    event_type=event_type,
-                    timestamp=ts,
-                    local_timestamp=local_ts,
-                    data=data
+                    event_type=EventType.TICKER,
+                    timestamp=int(timestamps[i]),
+                    local_timestamp=int(local_timestamps[i]),
+                    data={
+                        'last_price': float(last_prices[i]),
+                        'funding_rate': funding_rates[i] if not pd.isna(funding_rates[i]) else None,
+                    }
                 )
     
-    def _extract_data(self, name: str, row: pd.Series) -> Dict:
-        """이벤트 데이터 추출"""
-        if name == 'trades':
-            return {
-                'price': float(row.get('price', 0)),
-                'quantity': float(row.get('amount', 0)),
-                'side': row.get('side', 'unknown'),
-            }
-        elif name == 'ticker':
-            return {
-                'last_price': float(row.get('last_price', 0)),
-                'funding_rate': row.get('funding_rate'),
-            }
-        elif name == 'liquidations':
-            return {
-                'side': row.get('side', 'unknown'),
-                'quantity': float(row.get('amount', 0)),
-                'price': float(row.get('price', 0)),
-            }
-        return {}
+    def _stream_liquidations_fast(self) -> Iterator[Event]:
+        """Liquidations 빠른 스트리밍"""
+        path = self.files['liquidations']
+        chunk_size = 50_000
+        
+        for chunk in pd.read_csv(path, chunksize=chunk_size):
+            chunk = chunk.sort_values('local_timestamp')
+            
+            timestamps = chunk['timestamp'].values
+            local_timestamps = chunk['local_timestamp'].values
+            sides = chunk['side'].values if 'side' in chunk.columns else ['unknown'] * len(chunk)
+            amounts = chunk['amount'].values
+            prices = chunk['price'].values
+            
+            for i in range(len(chunk)):
+                yield Event(
+                    event_type=EventType.LIQUIDATION,
+                    timestamp=int(timestamps[i]),
+                    local_timestamp=int(local_timestamps[i]),
+                    data={
+                        'side': sides[i],
+                        'quantity': float(amounts[i]),
+                        'price': float(prices[i]),
+                    }
+                )
     
     async def get_events_async(self) -> AsyncIterator[Event]:
         """Historical은 동기지만 async 인터페이스도 제공"""
@@ -262,12 +280,14 @@ class HistoricalDataSource(DataSource):
 class RealtimeDataSource(DataSource):
     """
     Realtime 데이터 소스 (WebSocket)
+    
+    duration_sec=0 이면 무한 실행 (Ctrl+C로만 종료)
     """
     
-    def __init__(self, symbol: str = "btcusdt", duration_sec: int = 60):
+    def __init__(self, symbol: str = "btcusdt", duration_sec: int = 0):
         super().__init__()
         self.symbol = symbol
-        self.duration_sec = duration_sec
+        self.duration_sec = duration_sec  # 0 = 무한
         self.websocket_url = "wss://fstream.binance.com"
         
         # Robustness
@@ -291,38 +311,38 @@ class RealtimeDataSource(DataSource):
         return f"{self.websocket_url}/stream?streams={'/'.join(streams)}"
     
     def get_events(self) -> Iterator[Event]:
-        raise NotImplementedError("Realtime source requires async")
+        raise NotImplementedError("Realtime requires async")
+    
+    def _should_continue(self) -> bool:
+        """계속 실행해야 하는지 체크"""
+        if not self._is_running:
+            return False
+        
+        # duration_sec = 0 이면 무한 실행
+        if self.duration_sec == 0:
+            return True
+        
+        # 시간 제한 체크
+        elapsed = (datetime.now() - self.start_time).total_seconds()
+        return elapsed < self.duration_sec
     
     async def get_events_async(self) -> AsyncIterator[Event]:
-        """WebSocket에서 이벤트 읽기"""
+        """
+        WebSocket에서 이벤트 읽기
+        
+        duration_sec=0: 무한 실행 (Ctrl+C로 종료)
+        duration_sec>0: 해당 시간 후 자동 종료
+        """
         import websockets
         
         self._is_running = True
         self.start_time = datetime.now()
         uri = self.get_stream_uri()
         
-        while self._is_running:
-            elapsed = (datetime.now() - self.start_time).total_seconds()
-            if elapsed >= self.duration_sec:
-                break
-            
+        while self._should_continue():
             try:
-                async with websockets.connect(
-                    uri,
-                    ping_interval=20,
-                    ping_timeout=10,
-                ) as ws:
-                    if self.stats.reconnects > 0:
-                        print(f"\n  🔄 재연결 성공 (#{self.stats.reconnects})")
-                    else:
-                        print("✅ WebSocket 연결 성공!")
-                        print("📡 데이터 수신 대기 중...\n")
-                    
-                    while self._is_running:
-                        elapsed = (datetime.now() - self.start_time).total_seconds()
-                        if elapsed >= self.duration_sec:
-                            break
-                        
+                async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
+                    while self._should_continue():
                         try:
                             message = await asyncio.wait_for(ws.recv(), timeout=1.0)
                             event = self._parse_message(message)
@@ -331,9 +351,13 @@ class RealtimeDataSource(DataSource):
                         except asyncio.TimeoutError:
                             continue
             
+            except asyncio.CancelledError:
+                # Ctrl+C 등으로 취소됨
+                self._is_running = False
+                break
+            
             except Exception as e:
                 self.stats.reconnects += 1
-                print(f"\n  ⚠️ 연결 끊김: {e}. 3초 후 재연결...")
                 await asyncio.sleep(3)
                 continue
     
@@ -436,9 +460,7 @@ class RealtimeDataSource(DataSource):
 def create_data_source(mode: str, **kwargs) -> DataSource:
     """데이터 소스 팩토리"""
     if mode == 'historical':
-        return HistoricalDataSource(
-            data_dir=kwargs.get('data_dir', './data')
-        )
+        return HistoricalDataSource(data_dir=kwargs.get('data_dir', './data'))
     elif mode == 'realtime':
         return RealtimeDataSource(
             symbol=kwargs.get('symbol', 'btcusdt'),

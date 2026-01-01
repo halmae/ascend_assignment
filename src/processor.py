@@ -1,18 +1,18 @@
 """
-Processor - 통합 Decision Engine (v2)
+Processor - 통합 Decision Engine (v4 - AR(1) 모델)
 
 ================================================================================
 변경사항:
-1. z-score 기반 Stability 계산
-2. Time Alignment Policy 반영 (allowed_lateness, watermark)
-3. Liquidation cooldown 제거
+- AR1Calculator를 사용하여 spread dynamics 모델링
+- Stability = predictability (예측 가능성)
+- volatility + fit_quality 조합으로 판단
 ================================================================================
 """
 import json
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TextIO
 from dataclasses import dataclass, field
 
 from src.config import THRESHOLDS, get_thresholds_dict
@@ -22,7 +22,9 @@ from src.uncertainty import (
     UncertaintyVector,
     FreshnessUncertainty,
     IntegrityUncertainty,
-    StabilityUncertainty
+    StabilityUncertainty,
+    AR1Calculator,
+    AR1Diagnostics,
 )
 from src.state_machine import StateEvaluator, SystemState
 from src.consistency import ConsistencyChecker
@@ -38,9 +40,12 @@ class ProcessingResult:
     decision_counts: Dict[str, int] = field(default_factory=lambda: {
         'ALLOWED': 0, 'RESTRICTED': 0, 'HALTED': 0
     })
+    sanitization_counts: Dict[str, int] = field(default_factory=lambda: {
+        'ACCEPT': 0, 'REPAIR': 0, 'QUARANTINE': 0
+    })
     
-    state_transitions: List[Dict] = field(default_factory=list)
-    decisions_log: List[Dict] = field(default_factory=list)
+    state_transitions_count: int = 0
+    decisions_count: int = 0
     
     @property
     def total_decisions(self) -> int:
@@ -54,12 +59,27 @@ class ProcessingResult:
 
 class Processor:
     """
-    통합 Decision Engine (v2)
+    통합 Decision Engine (v4 - AR(1))
+    
+    핵심 변경:
+    - AR1Calculator로 spread dynamics 모델링
+    - predictability 기반 stability 판단
     """
     
-    def __init__(self, mode: str = ""):
+    def __init__(self, mode: str = "", output_dir: str = None):
         self.mode = mode
         self.th = THRESHOLDS
+        
+        # Output 디렉토리 설정
+        self.output_dir = Path(output_dir) if output_dir else None
+        
+        # 실시간 로그 파일 핸들
+        self._transitions_file: Optional[TextIO] = None
+        self._decisions_file: Optional[TextIO] = None
+        self._liquidations_file: Optional[TextIO] = None
+        
+        if self.output_dir:
+            self._init_log_files()
         
         # Core components
         self.state_evaluator = StateEvaluator()
@@ -72,8 +92,16 @@ class Processor:
             ask_levels={}
         )
         
-        # === Time Alignment Policy 관련 버퍼 ===
+        # === Buffers ===
         self.latencies: deque = deque(maxlen=self.th.latency_window_size)
+        
+        # === AR(1) Calculator for spread ===
+        self.ar1_calculator = AR1Calculator(
+            window_size=self.th.spread_history_size,
+            min_samples=self.th.ar1_min_samples
+        )
+        
+        # Legacy: volatility proxy 계산용
         self.spreads: deque = deque(maxlen=self.th.spread_history_size)
         
         # Out-of-order 추적
@@ -81,7 +109,7 @@ class Processor:
         self.out_of_order_count: int = 0
         self.late_event_count: int = 0
         
-        # Liquidation 추적 (로깅용)
+        # Liquidation 추적
         self.last_liquidation_ts: Optional[int] = None
         self.last_liquidation_size: float = 0.0
         
@@ -112,14 +140,40 @@ class Processor:
             'QUARANTINE': 0,
         }
         
-        # Logs
-        self.state_transitions: List[Dict] = []
-        self.decisions_log: List[Dict] = []
-        self.liquidation_events: List[Dict] = []
+        # Counters
+        self.state_transitions_count = 0
+        self.decisions_logged_count = 0
         
         # Timing
         self.start_time: Optional[datetime] = None
-        self.last_log_time: Optional[datetime] = None
+    
+    def _init_log_files(self):
+        """로그 파일 초기화"""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self._transitions_file = open(self.output_dir / "state_transitions.jsonl", 'w')
+        self._decisions_file = open(self.output_dir / "decisions.jsonl", 'w')
+        self._liquidations_file = open(self.output_dir / "liquidations.jsonl", 'w')
+    
+    def _log_transition(self, log: Dict):
+        """State transition 실시간 기록"""
+        self.state_transitions_count += 1
+        if self._transitions_file:
+            self._transitions_file.write(json.dumps(log) + '\n')
+            self._transitions_file.flush()
+    
+    def _log_decision(self, log: Dict):
+        """Decision 실시간 기록"""
+        self.decisions_logged_count += 1
+        if self._decisions_file:
+            self._decisions_file.write(json.dumps(log) + '\n')
+            self._decisions_file.flush()
+    
+    def _log_liquidation(self, log: Dict):
+        """Liquidation 실시간 기록"""
+        if self._liquidations_file:
+            self._liquidations_file.write(json.dumps(log) + '\n')
+            self._liquidations_file.flush()
     
     def process_event(self, event: Event) -> Optional[Dict]:
         """단일 이벤트 처리"""
@@ -154,7 +208,6 @@ class Processor:
         
         latency_ms = (event.local_timestamp - event.timestamp) / 1000.0
         
-        # Late event 체크
         if latency_ms > self.th.allowed_lateness_ms:
             self.late_event_count += 1
             self.stats['late_events'] += 1
@@ -190,6 +243,9 @@ class Processor:
                 self.orderbook.ask_levels[price] = qty
         
         self.orderbook.timestamp = event.timestamp
+        
+        # Spread 업데이트 (AR(1) 계산용)
+        self._update_spread_history()
     
     def _process_snapshot(self, event: Event):
         """Snapshot 처리"""
@@ -201,6 +257,10 @@ class Processor:
             bid_levels={float(p): float(q) for p, q in data.get('bids', [])},
             ask_levels={float(p): float(q) for p, q in data.get('asks', [])}
         )
+        
+        # AR(1) 리셋 (새 snapshot이면 연속성 끊김)
+        self.ar1_calculator.reset()
+        self.spreads.clear()
     
     def _process_liquidation(self, event: Event) -> Dict:
         """Liquidation 처리"""
@@ -216,7 +276,8 @@ class Processor:
             'quantity': self.last_liquidation_size,
             'price': float(data.get('price', 0)),
         }
-        self.liquidation_events.append(liq_event)
+        
+        self._log_liquidation(liq_event)
         
         return {'type': 'LIQUIDATION', **liq_event}
     
@@ -224,9 +285,6 @@ class Processor:
         """Ticker 처리 - Checkpoint"""
         self.stats['tickers'] += 1
         self.current_ticker = event.data
-        
-        if self.stats['tickers'] == 1:
-            print("📊 첫 Ticker 수신! Decision Engine 가동 중...")
         
         if not self.orderbook.bid_levels or not self.orderbook.ask_levels:
             return {'type': 'SKIP', 'reason': 'orderbook_not_initialized'}
@@ -249,8 +307,6 @@ class Processor:
             timestamp=event.timestamp
         )
         
-        self._update_spread_history()
-        
         # State Machine 평가
         spread_bps = self.orderbook.get_spread_bps()
         self.current_state = self.state_evaluator.evaluate(
@@ -262,32 +318,37 @@ class Processor:
         self.decision_counts[decision.value] += 1
         self.sanitization_counts[self.current_state.sanitization.value] += 1
         
-        # Uncertainty Snapshot
+        # Uncertainty Snapshot (AR(1) 정보 포함)
+        ar1 = stability.ar1
         uncertainty_snapshot = {
             'freshness': {
                 'avg_latency_ms': round(freshness.avg_lateness_ms, 2),
                 'max_latency_ms': round(freshness.max_lateness_ms, 2),
                 'stale_ratio': round(freshness.stale_event_ratio, 4),
-                'late_events': freshness.late_event_count,
-                'out_of_order': freshness.out_of_order_count,
             },
             'integrity': {
                 'spread_valid': integrity.spread_valid,
                 'price_in_spread': integrity.price_in_spread,
-                'price_deviation_bps': round(integrity.price_deviation_bps, 2),
+                'deviation_bps': round(integrity.price_deviation_bps, 2),
                 'sanitization': self.current_state.sanitization.value,
-                'imbalance': round(integrity.orderbook_imbalance, 3),
-                'imbalance_funding_mismatch': integrity.imbalance_funding_mismatch,
             },
             'stability': {
-                'spread_volatility': round(stability.spread_volatility, 4),
-                'spread_volatility_zscore': round(stability.spread_volatility_zscore, 2) if stability.spread_volatility_zscore else None,
-                'time_since_liquidation_ms': round(stability.time_since_liquidation_ms, 0) if stability.time_since_liquidation_ms else None,
+                # Legacy
+                'volatility_proxy': round(stability.spread_volatility_proxy, 4),
+                # AR(1) - None 처리
+                'ar1_phi': round(ar1.phi, 4),
+                'ar1_residual_std': round(ar1.residual_std, 6),
+                'ar1_fit_quality': round(ar1.fit_quality, 4) if ar1.fit_quality is not None else None,
+                'ar1_forecast_error': round(ar1.forecast_error, 6),
+                'ar1_n_samples': ar1.n_samples,
+                'predictability': round(stability.predictability, 4) if stability.predictability is not None else None,
+                # Liquidation
+                'time_since_liq_ms': round(stability.time_since_liquidation_ms, 0) if stability.time_since_liquidation_ms else None,
             },
             'spread_bps': round(spread_bps, 2) if spread_bps else None,
         }
         
-        # State 전이 감지
+        # State 전이 감지 → 파일 기록
         if (prev_state.data_trust != self.current_state.data_trust or
             prev_state.hypothesis != self.current_state.hypothesis):
             
@@ -308,10 +369,9 @@ class Processor:
                 },
                 'uncertainty': uncertainty_snapshot,
             }
-            self.state_transitions.append(transition_log)
-            self._print_state_transition(transition_log)
+            self._log_transition(transition_log)
         
-        # HALT/RESTRICT 로깅
+        # HALT/RESTRICT → 파일 기록
         if decision in [DecisionPermissionState.HALTED, DecisionPermissionState.RESTRICTED]:
             decision_log = {
                 'ts': event.timestamp,
@@ -320,18 +380,16 @@ class Processor:
                 'hypothesis': self.current_state.hypothesis.value,
                 'sanitization': self.current_state.sanitization.value,
                 'reasons': {
-                    'trust_reasons': self.current_state.trust_reasons,
-                    'hypothesis_reasons': self.current_state.hypothesis_reasons,
+                    'trust': self.current_state.trust_reasons,
+                    'hypothesis': self.current_state.hypothesis_reasons,
                 },
                 'uncertainty': uncertainty_snapshot,
             }
-            self.decisions_log.append(decision_log)
+            self._log_decision(decision_log)
         
         return {
             'type': 'DECISION',
             'decision': decision.value,
-            'data_trust': self.current_state.data_trust.value,
-            'hypothesis': self.current_state.hypothesis.value,
         }
     
     def _calculate_freshness(self) -> FreshnessUncertainty:
@@ -345,11 +403,8 @@ class Processor:
         freshness.avg_lateness_ms = sum(latencies) / len(latencies)
         freshness.max_lateness_ms = max(latencies)
         
-        # Stale ratio (allowed_lateness 초과 비율)
         stale_count = sum(1 for l in latencies if l > self.th.allowed_lateness_ms)
         freshness.stale_event_ratio = stale_count / len(latencies)
-        
-        # Late event / out-of-order count
         freshness.late_event_count = self.late_event_count
         freshness.out_of_order_count = self.out_of_order_count
         
@@ -367,25 +422,29 @@ class Processor:
         )
     
     def _calculate_stability(self, current_ts: int) -> StabilityUncertainty:
-        """Stability 계산 (z-score 기반)"""
+        """
+        Stability 계산 (AR(1) 기반)
+        
+        핵심: predictability = AR(1) fit quality
+        """
         stability = StabilityUncertainty()
         
-        # Spread volatility (CV)
+        # Legacy: Volatility proxy (CV)
         if len(self.spreads) >= 2:
             spreads = list(self.spreads)
             avg = sum(spreads) / len(spreads)
             if avg > 0:
                 variance = sum((s - avg) ** 2 for s in spreads) / len(spreads)
-                stability.spread_volatility = (variance ** 0.5) / avg
-                
-                # z-score 계산 (normal distribution 대비)
-                if self.th.normal_spread_std_bps > 0:
-                    # spread_volatility를 bps 단위로 변환하여 z-score 계산
-                    # 여기서는 volatility 자체의 z-score를 계산
-                    # TODO: 정상 volatility 분포 calibration 필요
-                    stability.spread_volatility_zscore = stability.spread_volatility / 0.05  # 임시
+                stability.spread_volatility_proxy = (variance ** 0.5) / avg
         
-        # Liquidation (로깅용)
+        # NEW: AR(1) diagnostics
+        ar1_diag = self.ar1_calculator.compute()
+        stability.ar1 = ar1_diag
+        
+        # Predictability = fit quality
+        stability.predictability = ar1_diag.fit_quality
+        
+        # Liquidation 정보
         if self.last_liquidation_ts:
             time_since = (current_ts - self.last_liquidation_ts) / 1000.0
             stability.time_since_liquidation_ms = time_since
@@ -395,53 +454,49 @@ class Processor:
     
     def _update_spread_history(self):
         """Spread 히스토리 업데이트"""
-        spread = self.orderbook.get_spread()
-        if spread is not None and spread > 0:
-            self.spreads.append(spread)
+        spread_bps = self.orderbook.get_spread_bps()
+        if spread_bps is not None and spread_bps > 0:
+            # Legacy buffer
+            self.spreads.append(spread_bps)
+            # AR(1) calculator
+            self.ar1_calculator.update(spread_bps)
     
-    def _print_state_transition(self, log: Dict):
-        """상태 전이 콘솔 출력"""
-        from_state = log['from']
-        to_state = log['to']
-        trigger = log['trigger']
-        
-        print(f"\n  🔄 STATE TRANSITION")
-        print(f"     Trust:      {from_state['data_trust']} → {to_state['data_trust']}")
-        print(f"     Hypothesis: {from_state['hypothesis']} → {to_state['hypothesis']}")
-        print(f"     Decision:   {to_state['decision']}")
-        
-        if trigger['trust_reasons']:
-            print(f"     Trust Reasons: {', '.join(trigger['trust_reasons'])}")
-        if trigger['hypothesis_reasons']:
-            print(f"     Hypothesis Reasons: {', '.join(trigger['hypothesis_reasons'])}")
+    def close(self):
+        """리소스 정리"""
+        if self._transitions_file:
+            self._transitions_file.close()
+        if self._decisions_file:
+            self._decisions_file.close()
+        if self._liquidations_file:
+            self._liquidations_file.close()
     
-    def print_status(self):
-        """현재 상태 출력"""
-        total = sum(self.decision_counts.values())
-        if total == 0:
+    def save_summary(self):
+        """Summary 저장"""
+        if not self.output_dir:
             return
         
-        allowed_pct = self.decision_counts['ALLOWED'] / total * 100
-        halted_pct = self.decision_counts['HALTED'] / total * 100
-        
+        total = sum(self.decision_counts.values())
         elapsed = (datetime.now() - self.start_time).total_seconds() if self.start_time else 0
         
-        print(f"\r[{elapsed:5.1f}s] Tickers: {self.stats['tickers']:>5} | "
-              f"ALLOWED: {allowed_pct:5.1f}% | HALTED: {halted_pct:5.1f}% | "
-              f"Liq: {self.stats['liquidations']}",
-              end='', flush=True)
-    
-    def should_log_status(self, interval_sec: float = 10.0) -> bool:
-        """상태 로그 출력 여부"""
-        now = datetime.now()
-        if self.last_log_time is None:
-            self.last_log_time = now
-            return True
+        summary = {
+            'mode': self.mode,
+            'processing_time_sec': round(elapsed, 2),
+            'thresholds': get_thresholds_dict(),
+            'stats': self.stats,
+            'decision_distribution': {
+                'counts': self.decision_counts,
+                'rates': {
+                    k: round(v / total * 100, 2) if total > 0 else 0
+                    for k, v in self.decision_counts.items()
+                }
+            },
+            'sanitization_distribution': self.sanitization_counts,
+            'state_transitions_count': self.state_transitions_count,
+            'decisions_logged_count': self.decisions_logged_count,
+        }
         
-        if (now - self.last_log_time).total_seconds() >= interval_sec:
-            self.last_log_time = now
-            return True
-        return False
+        with open(self.output_dir / "summary.json", 'w') as f:
+            json.dump(summary, f, indent=2)
     
     def get_result(self) -> ProcessingResult:
         """처리 결과 반환"""
@@ -452,74 +507,7 @@ class Processor:
             processing_time_sec=elapsed,
             stats=self.stats.copy(),
             decision_counts=self.decision_counts.copy(),
-            state_transitions=self.state_transitions,
-            decisions_log=self.decisions_log,
+            sanitization_counts=self.sanitization_counts.copy(),
+            state_transitions_count=self.state_transitions_count,
+            decisions_count=self.decisions_logged_count,
         )
-    
-    def save_outputs(self, output_dir: str):
-        """결과 저장"""
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        print(f"\n\n📁 결과 저장: {output_path}")
-        
-        # state_transitions.jsonl
-        with open(output_path / "state_transitions.jsonl", 'w') as f:
-            for t in self.state_transitions:
-                f.write(json.dumps(t) + '\n')
-        print(f"  ✅ state_transitions.jsonl ({len(self.state_transitions)} records)")
-        
-        # decisions.jsonl
-        with open(output_path / "decisions.jsonl", 'w') as f:
-            for d in self.decisions_log:
-                f.write(json.dumps(d) + '\n')
-        print(f"  ✅ decisions.jsonl ({len(self.decisions_log)} records)")
-        
-        # summary.json
-        total = sum(self.decision_counts.values())
-        summary = {
-            'mode': self.mode,
-            'processing_time_sec': (datetime.now() - self.start_time).total_seconds() if self.start_time else 0,
-            'thresholds_used': get_thresholds_dict(),
-            'stats': self.stats,
-            'decision_distribution': {
-                'counts': self.decision_counts,
-                'rates': {
-                    k: round(v / total * 100, 2) if total > 0 else 0
-                    for k, v in self.decision_counts.items()
-                }
-            },
-            'sanitization_distribution': self.sanitization_counts,
-            'state_transitions_count': len(self.state_transitions),
-        }
-        with open(output_path / "summary.json", 'w') as f:
-            json.dump(summary, f, indent=2)
-        print(f"  ✅ summary.json")
-    
-    def print_summary(self):
-        """최종 결과 출력"""
-        total = sum(self.decision_counts.values())
-        
-        print("\n" + "=" * 70)
-        print(f"📊 {self.mode.upper()} Validation 결과")
-        print("=" * 70)
-        
-        print("\n[Decision Distribution]")
-        for decision, count in self.decision_counts.items():
-            pct = count / total * 100 if total > 0 else 0
-            bar = "█" * int(pct / 2)
-            print(f"  {decision:12}: {count:>6} ({pct:5.1f}%) {bar}")
-        
-        print(f"\n[Sanitization Distribution]")
-        for san, count in self.sanitization_counts.items():
-            pct = count / total * 100 if total > 0 else 0
-            print(f"  {san:12}: {count:>6} ({pct:5.1f}%)")
-        
-        print(f"\n[Statistics]")
-        print(f"  Tickers:           {self.stats['tickers']:>8}")
-        print(f"  Liquidations:      {self.stats['liquidations']:>8}")
-        print(f"  Out-of-Order:      {self.stats['out_of_order']:>8}")
-        print(f"  Late Events:       {self.stats['late_events']:>8}")
-        print(f"  State Transitions: {len(self.state_transitions):>8}")
-        
-        print("=" * 70)

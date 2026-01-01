@@ -8,3 +8,4 @@ src/__pycache__
 run_historical.py
 run_realtime.py
 analyze_spread_liquidation.py
+analyze_ar1_liquidation.py
