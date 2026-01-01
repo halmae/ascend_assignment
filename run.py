@@ -168,12 +168,11 @@ def print_header(title: str, data_info: Dict = None):
             print(f"  {k}: {v}")
     
     print(f"\n[Thresholds]")
-    print(f"  allowed_lateness_ms:        {THRESHOLDS.allowed_lateness_ms}")
-    print(f"  ar1_min_samples:            {THRESHOLDS.ar1_min_samples}")
-    print(f"  ar1_fit_quality_valid:      {THRESHOLDS.ar1_fit_quality_valid}")
-    print(f"  ar1_fit_quality_invalid:    {THRESHOLDS.ar1_fit_quality_invalid}")
-    print(f"  ar1_forecast_error_valid:   {THRESHOLDS.ar1_forecast_error_valid_mult}σ")
-    print(f"  ar1_forecast_error_invalid: {THRESHOLDS.ar1_forecast_error_invalid_mult}σ")
+    print(f"  allowed_lateness_ms:           {THRESHOLDS.allowed_lateness_ms}")
+    print(f"  volatility_window_size:        {THRESHOLDS.volatility_window_size}")
+    print(f"  volatility_min_samples:        {THRESHOLDS.volatility_min_samples}")
+    print(f"  volatility_valid_threshold:    {THRESHOLDS.volatility_valid_threshold} bps (p90)")
+    print(f"  volatility_weakening_threshold:{THRESHOLDS.volatility_weakening_threshold} bps (p95)")
     print("=" * 70 + "\n")
 
 

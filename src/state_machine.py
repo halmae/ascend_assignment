@@ -1,22 +1,29 @@
 """
-State Machine - Decision Engine 핵심 로직 (v4 - AR(1) 기반)
+State Machine - 시스템 상태 관리 (v3 - Price Volatility)
 
 ================================================================================
-핵심 변경:
-- Stability 판단 = predictability (예측 가능성)
-- AR(1) fit quality + forecast error 기반 판단
-- "volatility ↑ 이면서 fit quality ↓" → INVALID
-
-판단 로직:
-- fit_quality > 0.5 AND forecast_error 정상 → VALID
-- fit_quality 0.3~0.5 OR forecast_error 약간 높음 → WEAKENING
-- fit_quality < 0.3 OR forecast_error 폭발 → INVALID
+v3 변경사항:
+- AR(1) 기반 Hypothesis 제거
+- Price Volatility 기반 Hypothesis로 교체
+- EDA 결과: 평상시 p90=0.50, p95=0.62 기준 사용
 ================================================================================
+
+핵심 구조:
+    Data Trust (Freshness + Integrity) → TRUSTED / DEGRADED / UNTRUSTED
+    Hypothesis (Volatility) → VALID / WEAKENING / INVALID
+    
+    Decision = f(Data Trust, Hypothesis)
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
+
 from src.config import THRESHOLDS
-from src.enums import DataTrustState, HypothesisState, DecisionPermissionState, SanitizationState
+from src.enums import (
+    DataTrustState,
+    HypothesisState,
+    DecisionPermissionState,
+    SanitizationState,
+)
 from src.uncertainty import UncertaintyVector
 
 
@@ -26,92 +33,64 @@ class SystemState:
     data_trust: DataTrustState = DataTrustState.TRUSTED
     hypothesis: HypothesisState = HypothesisState.VALID
     decision: DecisionPermissionState = DecisionPermissionState.ALLOWED
+    sanitization: SanitizationState = SanitizationState.ACCEPT
     
     trust_reasons: List[str] = field(default_factory=list)
     hypothesis_reasons: List[str] = field(default_factory=list)
-    sanitization: SanitizationState = SanitizationState.ACCEPT
 
 
 class StateEvaluator:
     """
-    State Machine 평가기 (v4 - AR(1) 기반)
+    State Machine Evaluator (v3 - Price Volatility)
     
-    Hypothesis 판단:
-    - AR(1) fit quality (predictability)
-    - Forecast error (예측 실패 정도)
-    - 두 지표의 조합으로 "모델 붕괴" 감지
+    평가 순서:
+    1. Data Trust 평가 (Freshness + Integrity)
+    2. Hypothesis 평가 (Volatility 기반)
+    3. Decision 결정 (Trust × Hypothesis Matrix)
     """
     
     def __init__(self):
         self.th = THRESHOLDS
-        self.max_event_time: int = 0
     
     def evaluate(self, 
                  uncertainty: UncertaintyVector,
                  orderbook_spread_bps: Optional[float] = None) -> SystemState:
-        """Uncertainty → SystemState"""
+        """전체 평가 수행"""
         state = SystemState()
         
-        if uncertainty.timestamp > self.max_event_time:
-            self.max_event_time = uncertainty.timestamp
-        
-        # 1. Data Trust (Freshness + Integrity)
+        # 1. Data Trust 평가
         self._evaluate_data_trust(uncertainty, state)
         
-        # 2. Hypothesis (AR(1) 기반 Predictability)
-        self._evaluate_hypothesis(uncertainty, orderbook_spread_bps, state)
+        # 2. Hypothesis 평가
+        self._evaluate_hypothesis(uncertainty, state)
         
-        # 3. Decision
+        # 3. Decision 결정
         self._determine_decision(state)
         
         return state
     
     def _evaluate_data_trust(self, uncertainty: UncertaintyVector, state: SystemState):
-        """Data Trust 평가"""
+        """
+        Data Trust 평가
+        
+        Freshness → latency, stale ratio
+        Integrity → Sanitization Policy
+        """
         trust = DataTrustState.TRUSTED
         reasons = []
-        sanitization = SanitizationState.ACCEPT
         
+        # Freshness
         freshness = uncertainty.freshness
         
-        # 음수 latency → QUARANTINE
-        if freshness.avg_lateness_ms < 0:
-            trust = DataTrustState.UNTRUSTED
-            sanitization = SanitizationState.QUARANTINE
-            reasons.append(f"negative_latency:{freshness.avg_lateness_ms:.1f}ms")
-            state.data_trust = trust
-            state.trust_reasons = reasons
-            state.sanitization = sanitization
-            return
-        
-        # Watermark 체크
-        watermark = self.max_event_time - int(self.th.watermark_delay_ms * 1000)
-        if uncertainty.timestamp < watermark:
-            trust = DataTrustState.UNTRUSTED
-            sanitization = SanitizationState.QUARANTINE
-            delay_ms = (watermark - uncertainty.timestamp) / 1000
-            reasons.append(f"behind_watermark:{delay_ms:.0f}ms")
-            state.data_trust = trust
-            state.trust_reasons = reasons
-            state.sanitization = sanitization
-            return
-        
-        # Latency
+        # Latency 기반
         if freshness.avg_lateness_ms > self.th.freshness_degraded_latency_ms:
             trust = DataTrustState.UNTRUSTED
             reasons.append(f"latency_high:{freshness.avg_lateness_ms:.1f}ms")
         elif freshness.avg_lateness_ms > self.th.freshness_trusted_latency_ms:
-            if trust == DataTrustState.TRUSTED:
-                trust = DataTrustState.DEGRADED
+            trust = DataTrustState.DEGRADED
             reasons.append(f"latency_elevated:{freshness.avg_lateness_ms:.1f}ms")
         
-        # Late event
-        if freshness.max_lateness_ms > self.th.allowed_lateness_ms:
-            if trust == DataTrustState.TRUSTED:
-                trust = DataTrustState.DEGRADED
-            reasons.append(f"late_event:{freshness.max_lateness_ms:.1f}ms")
-        
-        # Stale ratio
+        # Stale ratio 기반
         if freshness.stale_event_ratio > self.th.freshness_degraded_stale_ratio:
             trust = DataTrustState.UNTRUSTED
             reasons.append(f"stale_high:{freshness.stale_event_ratio:.2%}")
@@ -163,68 +142,46 @@ class StateEvaluator:
     
     def _evaluate_hypothesis(self, 
                              uncertainty: UncertaintyVector,
-                             spread_bps: Optional[float],
                              state: SystemState):
         """
-        Hypothesis 평가 (AR(1) 기반) - v2
+        Hypothesis 평가 (Price Volatility 기반)
         
-        핵심 변경:
-        1. fit_quality = None (unknown) → VALID (보수적)
-        2. φ 단독 조건 제거
-        3. forecast_error 기반 조건 강화
-        
-        판단 로직:
-        - VALID: fit_quality >= 0.6 AND forecast_error <= 2.5σ
-        - INVALID: fit_quality <= 0.25 OR forecast_error >= 4σ
-        - WEAKENING: 그 외 (gray zone)
+        판단 로직 (EDA 결과 기반):
+        - volatility = None (unknown) → VALID (보수적)
+        - volatility <= 0.50 (p90) → VALID
+        - volatility <= 0.62 (p95) → WEAKENING
+        - volatility > 0.62 → INVALID
         """
         hypothesis = HypothesisState.VALID
         reasons = []
         
         stability = uncertainty.stability
-        ar1 = stability.ar1
+        vol_diag = stability.volatility
         
         # === 1. 샘플 부족 (unknown) → VALID (보수적 처리) ===
-        if ar1.fit_quality is None:
+        if vol_diag.is_unknown:
             state.hypothesis = HypothesisState.VALID
-            state.hypothesis_reasons = [f"unknown:n={ar1.n_samples}"]
+            state.hypothesis_reasons = [f"unknown:n={vol_diag.n_samples}"]
             return
         
-        fit_quality = ar1.fit_quality
+        volatility = vol_diag.volatility
         
-        # 임계값
-        fit_valid = self.th.ar1_fit_quality_valid          # 0.6
-        fit_invalid = self.th.ar1_fit_quality_invalid      # 0.25
-        err_valid_mult = self.th.ar1_forecast_error_valid_mult    # 2.5
-        err_invalid_mult = self.th.ar1_forecast_error_invalid_mult  # 4.0
+        # 임계값 (config에서)
+        valid_threshold = self.th.volatility_valid_threshold       # 0.50 (p90)
+        weakening_threshold = self.th.volatility_weakening_threshold  # 0.62 (p95)
         
-        # === 2. Forecast Error 계산 ===
-        forecast_error_ratio = 0.0
-        if ar1.residual_std > 1e-10:
-            forecast_error_ratio = ar1.forecast_error / ar1.residual_std
-        
-        # === 3. INVALID 조건 (엄격) ===
-        # fit_quality <= 0.25 OR forecast_error >= 4σ
-        is_fit_invalid = fit_quality <= fit_invalid
-        is_forecast_exploding = forecast_error_ratio >= err_invalid_mult
-        
-        if is_fit_invalid or is_forecast_exploding:
-            hypothesis = HypothesisState.INVALID
-            if is_fit_invalid:
-                reasons.append(f"ar1_fit_invalid:{fit_quality:.3f}")
-            if is_forecast_exploding:
-                reasons.append(f"forecast_exploding:{forecast_error_ratio:.2f}σ")
-        
-        # === 4. VALID 조건 (관대) ===
-        # fit_quality >= 0.6 AND forecast_error <= 2.5σ
-        elif fit_quality >= fit_valid and forecast_error_ratio <= err_valid_mult:
+        # === 2. 판단 ===
+        if volatility <= valid_threshold:
             hypothesis = HypothesisState.VALID
             # 이유 없음 (정상)
         
-        # === 5. WEAKENING (gray zone) ===
-        else:
+        elif volatility <= weakening_threshold:
             hypothesis = HypothesisState.WEAKENING
-            reasons.append(f"ar1_gray:fit={fit_quality:.3f},err={forecast_error_ratio:.2f}σ")
+            reasons.append(f"volatility_elevated:{volatility:.3f}bps")
+        
+        else:
+            hypothesis = HypothesisState.INVALID
+            reasons.append(f"volatility_high:{volatility:.3f}bps")
         
         # === 추가 정보: Liquidation 근처 (참고용) ===
         if stability.time_since_liquidation_ms is not None:

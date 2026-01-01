@@ -1,11 +1,11 @@
 """
-Processor - 통합 Decision Engine (v4 - AR(1) 모델)
+Processor - 통합 Decision Engine (v5 - Price Volatility)
 
 ================================================================================
-변경사항:
-- AR1Calculator를 사용하여 spread dynamics 모델링
-- Stability = predictability (예측 가능성)
-- volatility + fit_quality 조합으로 판단
+v5 변경사항:
+- AR(1) 제거 (spread 변동이 너무 작아 무의미)
+- Price Volatility (window=75) 기반 Stability
+- EDA 결과: Cohen's d = 0.537 (Medium effect)
 ================================================================================
 """
 import json
@@ -23,8 +23,8 @@ from src.uncertainty import (
     FreshnessUncertainty,
     IntegrityUncertainty,
     StabilityUncertainty,
-    AR1Calculator,
-    AR1Diagnostics,
+    VolatilityCalculator,
+    VolatilityDiagnostics,
 )
 from src.state_machine import StateEvaluator, SystemState
 from src.consistency import ConsistencyChecker
@@ -59,11 +59,11 @@ class ProcessingResult:
 
 class Processor:
     """
-    통합 Decision Engine (v4 - AR(1))
+    통합 Decision Engine (v5 - Price Volatility)
     
     핵심 변경:
-    - AR1Calculator로 spread dynamics 모델링
-    - predictability 기반 stability 판단
+    - VolatilityCalculator로 price dynamics 모델링
+    - Rolling std of returns 기반 stability 판단
     """
     
     def __init__(self, mode: str = "", output_dir: str = None):
@@ -95,14 +95,11 @@ class Processor:
         # === Buffers ===
         self.latencies: deque = deque(maxlen=self.th.latency_window_size)
         
-        # === AR(1) Calculator for spread ===
-        self.ar1_calculator = AR1Calculator(
-            window_size=self.th.spread_history_size,
-            min_samples=self.th.ar1_min_samples
+        # === Volatility Calculator for mid price ===
+        self.volatility_calculator = VolatilityCalculator(
+            window_size=self.th.volatility_window_size,
+            min_samples=self.th.volatility_min_samples
         )
-        
-        # Legacy: volatility proxy 계산용
-        self.spreads: deque = deque(maxlen=self.th.spread_history_size)
         
         # Out-of-order 추적
         self.last_event_time: int = 0
@@ -244,8 +241,8 @@ class Processor:
         
         self.orderbook.timestamp = event.timestamp
         
-        # Spread 업데이트 (AR(1) 계산용)
-        self._update_spread_history()
+        # Mid price 업데이트 → Volatility 계산
+        self._update_volatility()
     
     def _process_snapshot(self, event: Event):
         """Snapshot 처리"""
@@ -258,9 +255,8 @@ class Processor:
             ask_levels={float(p): float(q) for p, q in data.get('asks', [])}
         )
         
-        # AR(1) 리셋 (새 snapshot이면 연속성 끊김)
-        self.ar1_calculator.reset()
-        self.spreads.clear()
+        # Volatility 리셋 (새 snapshot이면 연속성 끊김)
+        self.volatility_calculator.reset()
     
     def _process_liquidation(self, event: Event) -> Dict:
         """Liquidation 처리"""
@@ -318,8 +314,8 @@ class Processor:
         self.decision_counts[decision.value] += 1
         self.sanitization_counts[self.current_state.sanitization.value] += 1
         
-        # Uncertainty Snapshot (AR(1) 정보 포함)
-        ar1 = stability.ar1
+        # Uncertainty Snapshot (Volatility 정보 포함)
+        vol_diag = stability.volatility
         uncertainty_snapshot = {
             'freshness': {
                 'avg_latency_ms': round(freshness.avg_lateness_ms, 2),
@@ -333,19 +329,13 @@ class Processor:
                 'sanitization': self.current_state.sanitization.value,
             },
             'stability': {
-                # Legacy
-                'volatility_proxy': round(stability.spread_volatility_proxy, 4),
-                # AR(1) - None 처리
-                'ar1_phi': round(ar1.phi, 4),
-                'ar1_residual_std': round(ar1.residual_std, 6),
-                'ar1_fit_quality': round(ar1.fit_quality, 4) if ar1.fit_quality is not None else None,
-                'ar1_forecast_error': round(ar1.forecast_error, 6),
-                'ar1_n_samples': ar1.n_samples,
-                'predictability': round(stability.predictability, 4) if stability.predictability is not None else None,
+                # Price Volatility
+                'volatility_bps': round(vol_diag.volatility, 4) if vol_diag.volatility is not None else None,
+                'volatility_n_samples': vol_diag.n_samples,
                 # Liquidation
                 'time_since_liq_ms': round(stability.time_since_liquidation_ms, 0) if stability.time_since_liquidation_ms else None,
             },
-            'spread_bps': round(spread_bps, 2) if spread_bps else None,
+            'spread_bps': round(spread_bps, 4) if spread_bps else None,
         }
         
         # State 전이 감지 → 파일 기록
@@ -423,26 +413,12 @@ class Processor:
     
     def _calculate_stability(self, current_ts: int) -> StabilityUncertainty:
         """
-        Stability 계산 (AR(1) 기반)
-        
-        핵심: predictability = AR(1) fit quality
+        Stability 계산 (Price Volatility 기반)
         """
         stability = StabilityUncertainty()
         
-        # Legacy: Volatility proxy (CV)
-        if len(self.spreads) >= 2:
-            spreads = list(self.spreads)
-            avg = sum(spreads) / len(spreads)
-            if avg > 0:
-                variance = sum((s - avg) ** 2 for s in spreads) / len(spreads)
-                stability.spread_volatility_proxy = (variance ** 0.5) / avg
-        
-        # NEW: AR(1) diagnostics
-        ar1_diag = self.ar1_calculator.compute()
-        stability.ar1 = ar1_diag
-        
-        # Predictability = fit quality
-        stability.predictability = ar1_diag.fit_quality
+        # Volatility diagnostics
+        stability.volatility = self.volatility_calculator.compute()
         
         # Liquidation 정보
         if self.last_liquidation_ts:
@@ -452,14 +428,22 @@ class Processor:
         
         return stability
     
-    def _update_spread_history(self):
-        """Spread 히스토리 업데이트"""
-        spread_bps = self.orderbook.get_spread_bps()
-        if spread_bps is not None and spread_bps > 0:
-            # Legacy buffer
-            self.spreads.append(spread_bps)
-            # AR(1) calculator
-            self.ar1_calculator.update(spread_bps)
+    def _update_volatility(self):
+        """Mid price로 Volatility 업데이트"""
+        if not self.orderbook.bid_levels or not self.orderbook.ask_levels:
+            return
+        
+        best_bid = self.orderbook.get_best_bid()
+        best_ask = self.orderbook.get_best_ask()
+        
+        if best_bid is None or best_ask is None:
+            return
+        
+        if best_bid >= best_ask:
+            return  # Crossed market
+        
+        mid_price = (best_bid + best_ask) / 2
+        self.volatility_calculator.update(mid_price)
     
     def close(self):
         """리소스 정리"""

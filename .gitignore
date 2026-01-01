@@ -8,4 +8,7 @@ src/__pycache__
 run_historical.py
 run_realtime.py
 analyze_spread_liquidation.py
-analyze_ar1_liquidation.py
+analyze_ar1_stability.py
+analyze_ar2_stability.py
+analyze_volatility_window.py
+analyze_depth_volatility.py
