@@ -1,10 +1,10 @@
 {
   "mode": "research",
-  "processing_time_sec": 1019.64,
+  "processing_time_sec": 994.83,
   "thresholds": {
     "time_alignment": {
-      "buffer_max_size": 100,
-      "window_size_ms": 30.0,
+      "buffer_max_size": 1000,
+      "window_size_ms": 100.0,
       "allowed_lateness_ms": 10.0
     },
     "freshness": {
@@ -29,41 +29,41 @@
   },
   "stats": {
     "events_received": 5721732,
-    "events_processed": 4766126,
+    "events_processed": 4755624,
     "trades": 2998537,
     "orderbook_updates": 1665505,
-    "tickers": 100522,
+    "tickers": 90020,
     "liquidations": 1560,
     "snapshots": 2,
     "duplicates_skipped": 951449
   },
   "buffer_stats": {
     "total_received": 4770283,
-    "total_emitted": 4766126,
-    "dropped_late": 4157,
+    "total_emitted": 4755624,
+    "dropped_late": 14659,
     "out_of_order_received": 1364,
-    "max_buffer_size": 8718,
-    "windows_emitted": 2873946,
+    "max_buffer_size": 1000,
+    "windows_emitted": 863999,
     "current_buffer_size": 0,
     "current_watermark_ms": 1760054399955.0
   },
   "decision_distribution": {
     "counts": {
-      "ALLOWED": 69824,
-      "RESTRICTED": 28449,
-      "HALTED": 2248
+      "ALLOWED": 61000,
+      "RESTRICTED": 27053,
+      "HALTED": 1966
     },
     "rates": {
-      "ALLOWED": 69.46,
-      "RESTRICTED": 28.3,
-      "HALTED": 2.24
+      "ALLOWED": 67.76,
+      "RESTRICTED": 30.05,
+      "HALTED": 2.18
     }
   },
   "sanitization_distribution": {
-    "ACCEPT": 72262,
-    "REPAIR": 26419,
-    "QUARANTINE": 1840
+    "ACCEPT": 63203,
+    "REPAIR": 25277,
+    "QUARANTINE": 1539
   },
-  "state_transitions_count": 20006,
-  "decisions_logged_count": 100521
+  "state_transitions_count": 19718,
+  "decisions_logged_count": 90019
 }

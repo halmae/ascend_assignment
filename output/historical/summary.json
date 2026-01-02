@@ -5,78 +5,78 @@
     "validation"
   ],
   "combined": {
-    "total_decisions": 199947,
+    "total_decisions": 175346,
     "decision_counts": {
-      "ALLOWED": 116780,
-      "RESTRICTED": 49317,
-      "HALTED": 33850
+      "ALLOWED": 101744,
+      "RESTRICTED": 47073,
+      "HALTED": 26529
     },
     "decision_rates": {
-      "ALLOWED": 58.41,
-      "RESTRICTED": 24.67,
-      "HALTED": 16.93
+      "ALLOWED": 58.02,
+      "RESTRICTED": 26.85,
+      "HALTED": 15.13
     },
-    "state_transitions": 27354,
-    "processing_time_sec": 2090.9
+    "state_transitions": 30201,
+    "processing_time_sec": 2097.88
   },
   "research": {
-    "total_decisions": 100521,
+    "total_decisions": 90019,
     "decision_counts": {
-      "ALLOWED": 69824,
-      "RESTRICTED": 28449,
-      "HALTED": 2248
+      "ALLOWED": 61000,
+      "RESTRICTED": 27053,
+      "HALTED": 1966
     },
     "decision_rates": {
-      "ALLOWED": 69.46,
-      "RESTRICTED": 28.3,
-      "HALTED": 2.24
+      "ALLOWED": 67.76,
+      "RESTRICTED": 30.05,
+      "HALTED": 2.18
     },
     "stats": {
       "events_received": 5721732,
-      "events_processed": 4766126,
+      "events_processed": 4755624,
       "trades": 2998537,
       "orderbook_updates": 1665505,
-      "tickers": 100522,
+      "tickers": 90020,
       "liquidations": 1560,
       "snapshots": 2,
       "duplicates_skipped": 951449
     },
-    "state_transitions": 20006
+    "state_transitions": 19718
   },
   "validation": {
-    "total_decisions": 99426,
+    "total_decisions": 85327,
     "decision_counts": {
-      "ALLOWED": 46956,
-      "RESTRICTED": 20868,
-      "HALTED": 31602
+      "ALLOWED": 40744,
+      "RESTRICTED": 20020,
+      "HALTED": 24563
     },
     "decision_rates": {
-      "ALLOWED": 47.23,
-      "RESTRICTED": 20.99,
-      "HALTED": 31.78
+      "ALLOWED": 47.75,
+      "RESTRICTED": 23.46,
+      "HALTED": 28.79
     },
     "stats": {
       "events_received": 10750566,
-      "events_processed": 9150775,
-      "trades": 7374469,
-      "orderbook_updates": 1673401,
-      "tickers": 99429,
-      "liquidations": 3474,
-      "snapshots": 2,
+      "events_processed": 9182755,
+      "trades": 7418883,
+      "orderbook_updates": 1675049,
+      "tickers": 85330,
+      "liquidations": 3492,
+      "snapshots": 1,
       "duplicates_skipped": 1538482
     },
-    "state_transitions": 7348
+    "state_transitions": 10483
   },
   "comparison": {
-    "allowed_delta": -22.2,
-    "halted_delta": 29.5,
+    "allowed_delta": -20.0,
+    "halted_delta": 26.6,
     "out_of_order_ratio": 0.0,
-    "liquidation_ratio": 2.23
+    "liquidation_ratio": 2.24
   },
   "thresholds": {
     "time_alignment": {
-      "buffer_max_size": 100,
-      "window_size_ms": 30.0,
+      "buffer_max_size": 1000,
+      "window_size_ms": 100.0,
       "allowed_lateness_ms": 10.0
     },
     "freshness": {

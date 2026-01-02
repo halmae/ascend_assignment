@@ -18,3 +18,5 @@ analyze_crossed_ooo.py
 test_time_alignment.py
 analyze_results.py
 diagnose_realtime_volatility.py
+analyze_realtime_halted.py
+analyze_liquidation_state.py

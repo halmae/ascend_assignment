@@ -1,6 +1,6 @@
 {
   "mode": "realtime",
-  "processing_time_sec": 6243.13,
+  "processing_time_sec": 480.1,
   "thresholds": {
     "time_alignment": {
       "buffer_max_size": 1000,
@@ -28,42 +28,42 @@
     }
   },
   "stats": {
-    "events_received": 213814,
-    "events_processed": 181560,
-    "trades": 119038,
-    "orderbook_updates": 60828,
-    "tickers": 1649,
-    "liquidations": 45,
+    "events_received": 111416,
+    "events_processed": 89166,
+    "trades": 84323,
+    "orderbook_updates": 4587,
+    "tickers": 223,
+    "liquidations": 33,
     "snapshots": 0,
-    "duplicates_skipped": 30790
+    "duplicates_skipped": 22240
   },
   "buffer_stats": {
-    "total_received": 183024,
-    "total_emitted": 181560,
-    "dropped_late": 1464,
+    "total_received": 89176,
+    "total_emitted": 89166,
+    "dropped_late": 10,
     "out_of_order_received": 0,
-    "max_buffer_size": 952,
-    "windows_emitted": 62358,
+    "max_buffer_size": 1000,
+    "windows_emitted": 4678,
     "current_buffer_size": 0,
-    "current_watermark_ms": 1767357761955.0
+    "current_watermark_ms": 1767365081471.0
   },
   "decision_distribution": {
     "counts": {
-      "ALLOWED": 602,
-      "RESTRICTED": 24,
-      "HALTED": 1023
+      "ALLOWED": 60,
+      "RESTRICTED": 40,
+      "HALTED": 123
     },
     "rates": {
-      "ALLOWED": 36.51,
-      "RESTRICTED": 1.46,
-      "HALTED": 62.04
+      "ALLOWED": 26.91,
+      "RESTRICTED": 17.94,
+      "HALTED": 55.16
     }
   },
   "sanitization_distribution": {
-    "ACCEPT": 1549,
-    "REPAIR": 100,
+    "ACCEPT": 165,
+    "REPAIR": 58,
     "QUARANTINE": 0
   },
-  "state_transitions_count": 49,
-  "decisions_logged_count": 1649
+  "state_transitions_count": 63,
+  "decisions_logged_count": 223
 }

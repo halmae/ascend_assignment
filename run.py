@@ -587,11 +587,11 @@ Examples:
     # Docker mode support (positional argument)
     if args.docker_mode:
         args.mode = args.docker_mode
+        # Docker 기본 경로 설정
+        args.output = '/output'
         if args.mode == 'historical' and not args.data and not args.research:
-            # Docker 기본 경로
             args.data = '/data'
             args.name = 'Historical'
-            args.output = '/output'
     
     if args.show_config:
         print_thresholds()

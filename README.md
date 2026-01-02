@@ -13,7 +13,9 @@ Dirty Data를 명시적인 예외 처리로 분리하지 않고, Uncertainty Vec
 
 Uncertainty Vector
 ├── Freshness: avg_latency, stale_ratio, out_of_order_count
+
 ├── Integrity: spread_valid, price_deviation, imbalance_funding_mismatch
+
 └── Stability: price_volatility (rolling std of returns)
 
 이 중 Freshness와 Integrity를 Dirty Data 판단의 핵심 축으로 사용했다.
@@ -58,7 +60,7 @@ EDA 단계에서 다양한 지표들을 테스트하며 가장 단순한 것(Pri
 
 다만, 아쉬운 점:
 1. Research와 Validation의 측정 목표 명확화 부족
-    - 무엇을 측정하고 싶은지 사전에 더 명확히 정의했어야 함
+    - 무엇을 측정하고 싶은지 사전에 더 명확히 정의했어야 함. Orderbook State Definition에 대한 고민이 충분하지 못 했다는 생각이 듬.
 2. EDA용 시뮬레이션 데이터 분리
     - 주어진 데이터에서 calibration용과 validation용을 미리 분리했어야 함
     - Time-based split 등으로 overfitting 고려
