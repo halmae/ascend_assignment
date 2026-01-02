@@ -12,6 +12,7 @@ Orderbook의 신선도(Freshness)와 일관성(Integrity)이 가장 위험한 �
 Dirty Data를 명시적인 예외 처리로 분리하지 않고, Uncertainty Vector 내부의 크기와 상태로 표현했다.
 
 Uncertainty Vector
+
 ├── Freshness: avg_latency, stale_ratio, out_of_order_count
 
 ├── Integrity: spread_valid, price_deviation, imbalance_funding_mismatch
