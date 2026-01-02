@@ -137,6 +137,10 @@ class BufferedProcessor:
         self.current_state = SystemState()
         self.current_ticker: Dict = {}
         
+        # Duration 계산용 이전 timestamp
+        self.last_transition_ts: Optional[int] = None
+        self.last_decision_ts: Optional[int] = None
+        
         # Stats
         self.stats = {
             'events_received': 0,
@@ -176,15 +180,37 @@ class BufferedProcessor:
         self._decisions_file = open(self.output_dir / "decisions.jsonl", 'w')
     
     def _log_transition(self, log: Dict):
-        """State transition 기록"""
+        """State transition 기록 (duration_ms 포함)"""
+        current_ts = log.get('ts', 0)
+        
+        # 이전 transition이 있으면 duration_ms 계산
+        if self.last_transition_ts is not None:
+            duration_ms = (current_ts - self.last_transition_ts) / 1000.0  # us → ms
+            log['duration_ms'] = round(duration_ms, 1)
+        else:
+            log['duration_ms'] = None  # 첫 번째 transition
+        
+        self.last_transition_ts = current_ts
         self.state_transitions_count += 1
+        
         if self._transitions_file:
             self._transitions_file.write(json.dumps(log) + '\n')
             self._transitions_file.flush()
     
     def _log_decision(self, log: Dict):
-        """Decision 기록"""
+        """Decision 기록 (duration_ms 포함)"""
+        current_ts = log.get('ts', 0)
+        
+        # 이전 decision이 있으면 duration_ms 계산
+        if self.last_decision_ts is not None:
+            duration_ms = (current_ts - self.last_decision_ts) / 1000.0  # us → ms
+            log['duration_ms'] = round(duration_ms, 1)
+        else:
+            log['duration_ms'] = None  # 첫 번째 decision
+        
+        self.last_decision_ts = current_ts
         self.decisions_logged_count += 1
+        
         if self._decisions_file:
             self._decisions_file.write(json.dumps(log) + '\n')
             self._decisions_file.flush()
