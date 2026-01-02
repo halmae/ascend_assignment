@@ -64,6 +64,7 @@ class Processor:
     핵심 변경:
     - VolatilityCalculator로 price dynamics 모델링
     - Rolling std of returns 기반 stability 판단
+    - Duplicate 이벤트 감지 및 스킵
     """
     
     def __init__(self, mode: str = "", output_dir: str = None):
@@ -101,6 +102,10 @@ class Processor:
             min_samples=self.th.volatility_min_samples
         )
         
+        # === Duplicate 감지용 ===
+        # (timestamp, event_type) 조합으로 최근 이벤트 추적
+        self._recent_events: deque = deque(maxlen=1000)
+        
         # Out-of-order 추적
         self.last_event_time: int = 0
         self.out_of_order_count: int = 0
@@ -123,6 +128,7 @@ class Processor:
             'snapshots': 0,
             'out_of_order': 0,
             'late_events': 0,
+            'duplicates_skipped': 0,  # 추가
         }
         
         self.decision_counts = {
@@ -177,6 +183,11 @@ class Processor:
         if self.start_time is None:
             self.start_time = datetime.now()
         
+        # === Duplicate 체크 및 스킵 ===
+        if self._is_duplicate(event):
+            self.stats['duplicates_skipped'] += 1
+            return None
+        
         # Out-of-order 체크
         if event.timestamp < self.last_event_time:
             self.out_of_order_count += 1
@@ -198,6 +209,44 @@ class Processor:
             return self._process_ticker(event)
         
         return None
+    
+    def _is_duplicate(self, event: Event) -> bool:
+        """
+        중복 이벤트 감지
+        
+        동일한 (timestamp, event_type, 핵심데이터)면 중복으로 판단
+        """
+        # 이벤트 타입별 핵심 데이터 추출
+        if event.event_type == EventType.TRADE:
+            # Trade: timestamp + price + quantity
+            key_data = (
+                event.data.get('price'),
+                event.data.get('quantity'),
+                event.data.get('side'),
+            )
+        elif event.event_type == EventType.LIQUIDATION:
+            # Liquidation: timestamp + price + quantity
+            key_data = (
+                event.data.get('price'),
+                event.data.get('quantity'),
+                event.data.get('side'),
+            )
+        elif event.event_type == EventType.TICKER:
+            # Ticker: timestamp + last_price
+            key_data = (event.data.get('last_price'),)
+        else:
+            # Orderbook/Snapshot: timestamp만으로 체크
+            key_data = ()
+        
+        event_key = (event.timestamp, event.event_type.value, key_data)
+        
+        # 중복 체크
+        if event_key in self._recent_events:
+            return True
+        
+        # 새 이벤트 등록
+        self._recent_events.append(event_key)
+        return False
     
     def _process_trade(self, event: Event):
         """Trade 처리"""

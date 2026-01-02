@@ -1,12 +1,11 @@
 {
   "mode": "validation",
-  "processing_time_sec": 981.14,
+  "processing_time_sec": 1041.49,
   "thresholds": {
     "time_alignment": {
-      "allowed_lateness_ms": 100.0,
-      "buffer_duration_ms": 50.0,
+      "buffer_max_size": 10000,
       "window_size_ms": 1000.0,
-      "watermark_delay_ms": 200.0
+      "allowed_lateness_ms": 100.0
     },
     "freshness": {
       "trusted_latency_ms": 20.0,
@@ -15,7 +14,9 @@
       "degraded_stale_ratio": 0.15
     },
     "integrity": {
-      "repair_threshold_bps": 5.0,
+      "crossed_accept_threshold_bps": 10.0,
+      "crossed_quarantine_threshold_bps": 30.0,
+      "price_outside_quarantine_bps": 10.0,
       "imbalance_threshold": 0.3,
       "funding_rate_significant": 0.0001
     },
@@ -27,31 +28,42 @@
     }
   },
   "stats": {
-    "trades": 8951352,
-    "orderbook_updates": 1675163,
-    "tickers": 120546,
+    "events_received": 10750566,
+    "events_processed": 9211980,
+    "trades": 7425041,
+    "orderbook_updates": 1675162,
+    "tickers": 108273,
     "liquidations": 3499,
-    "snapshots": 6,
-    "out_of_order": 381778,
-    "late_events": 17907
+    "snapshots": 5,
+    "duplicates_skipped": 1538482
+  },
+  "buffer_stats": {
+    "total_received": 9212084,
+    "total_emitted": 9211980,
+    "dropped_late": 104,
+    "out_of_order_received": 133672,
+    "max_buffer_size": 5764,
+    "windows_emitted": 86399,
+    "current_buffer_size": 0,
+    "current_watermark_ms": 1760140799985.0
   },
   "decision_distribution": {
     "counts": {
-      "ALLOWED": 47336,
-      "RESTRICTED": 16356,
-      "HALTED": 56851
+      "ALLOWED": 52970,
+      "RESTRICTED": 22340,
+      "HALTED": 32960
     },
     "rates": {
-      "ALLOWED": 39.27,
-      "RESTRICTED": 13.57,
-      "HALTED": 47.16
+      "ALLOWED": 48.92,
+      "RESTRICTED": 20.63,
+      "HALTED": 30.44
     }
   },
   "sanitization_distribution": {
-    "ACCEPT": 47452,
-    "REPAIR": 16414,
-    "QUARANTINE": 56677
+    "ACCEPT": 53136,
+    "REPAIR": 22411,
+    "QUARANTINE": 32723
   },
-  "state_transitions_count": 13006,
-  "decisions_logged_count": 73207
+  "state_transitions_count": 13016,
+  "decisions_logged_count": 108270
 }

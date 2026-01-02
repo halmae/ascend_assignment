@@ -11,3 +11,8 @@ analyze_ar1_stability.py
 analyze_ar2_stability.py
 analyze_volatility_window.py
 analyze_depth_volatility.py
+analyze_crossed_market.py
+analyze_halted_reasons.py
+analyze_halted_repair.py
+analyze_crossed_ooo.py
+test_time_alignment.py

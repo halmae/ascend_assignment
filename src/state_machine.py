@@ -114,7 +114,20 @@ class StateEvaluator:
         state.sanitization = sanitization
     
     def _classify_sanitization(self, integrity, reasons: List[str]) -> SanitizationState:
-        """Sanitization Policy"""
+        """
+        Sanitization Policy (3단계)
+        
+        Crossed Market 처리:
+          - < 10 bps:  ACCEPT (시장 노이즈)
+          - < 30 bps:  REPAIR (주의 필요하나 판단 가능)
+          - >= 30 bps: QUARANTINE (신뢰 불가)
+        
+        Price Outside Spread 처리:
+          - < 5 bps:   REPAIR
+          - < 10 bps:  REPAIR
+          - >= 10 bps: QUARANTINE
+        """
+        # 정상 케이스: spread valid & price in spread
         if integrity.spread_valid and integrity.price_in_spread:
             if integrity.imbalance_funding_mismatch:
                 if self.th.imbalance_funding_strict:
@@ -125,19 +138,33 @@ class StateEvaluator:
                     return SanitizationState.REPAIR
             return SanitizationState.ACCEPT
         
+        # Crossed Market (bid >= ask)
         if not integrity.spread_valid:
-            if integrity.price_deviation_bps >= self.th.integrity_repair_threshold_bps:
-                reasons.append(f"crossed_market:{integrity.price_deviation_bps:.1f}bps")
-                return SanitizationState.QUARANTINE
-            else:
-                reasons.append(f"crossed_minor:{integrity.price_deviation_bps:.1f}bps")
+            deviation = integrity.price_deviation_bps
+            
+            if deviation < self.th.crossed_accept_threshold_bps:
+                # 작은 crossed: 시장 노이즈로 허용
+                # 로그에는 남기지만 ACCEPT
+                return SanitizationState.ACCEPT
+            
+            elif deviation < self.th.crossed_quarantine_threshold_bps:
+                # 중간 crossed: 주의 필요
+                reasons.append(f"crossed_repair:{deviation:.1f}bps")
                 return SanitizationState.REPAIR
+            
+            else:
+                # 심각한 crossed: 신뢰 불가
+                reasons.append(f"crossed_quarantine:{deviation:.1f}bps")
+                return SanitizationState.QUARANTINE
         
-        if integrity.price_deviation_bps >= self.th.integrity_repair_threshold_bps * 2:
-            reasons.append(f"price_outside:{integrity.price_deviation_bps:.1f}bps")
+        # Price outside spread (spread는 정상이지만 price가 밖에 있음)
+        deviation = integrity.price_deviation_bps
+        
+        if deviation >= self.th.price_outside_quarantine_bps:
+            reasons.append(f"price_outside:{deviation:.1f}bps")
             return SanitizationState.QUARANTINE
         
-        reasons.append(f"price_outside_minor:{integrity.price_deviation_bps:.1f}bps")
+        reasons.append(f"price_outside_minor:{deviation:.1f}bps")
         return SanitizationState.REPAIR
     
     def _evaluate_hypothesis(self, 

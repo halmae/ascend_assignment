@@ -1,12 +1,11 @@
 {
   "mode": "research",
-  "processing_time_sec": 1011.59,
+  "processing_time_sec": 1011.14,
   "thresholds": {
     "time_alignment": {
-      "allowed_lateness_ms": 100.0,
-      "buffer_duration_ms": 50.0,
+      "buffer_max_size": 10000,
       "window_size_ms": 1000.0,
-      "watermark_delay_ms": 200.0
+      "allowed_lateness_ms": 100.0
     },
     "freshness": {
       "trusted_latency_ms": 20.0,
@@ -15,7 +14,9 @@
       "degraded_stale_ratio": 0.15
     },
     "integrity": {
-      "repair_threshold_bps": 5.0,
+      "crossed_accept_threshold_bps": 10.0,
+      "crossed_quarantine_threshold_bps": 30.0,
+      "price_outside_quarantine_bps": 10.0,
       "imbalance_threshold": 0.3,
       "funding_rate_significant": 0.0001
     },
@@ -27,31 +28,42 @@
     }
   },
   "stats": {
-    "trades": 3938198,
+    "events_received": 5721732,
+    "events_processed": 4770114,
+    "trades": 2998537,
     "orderbook_updates": 1665505,
-    "tickers": 116466,
+    "tickers": 104509,
     "liquidations": 1561,
     "snapshots": 2,
-    "out_of_order": 142661,
-    "late_events": 506
+    "duplicates_skipped": 951449
+  },
+  "buffer_stats": {
+    "total_received": 4770283,
+    "total_emitted": 4770114,
+    "dropped_late": 169,
+    "out_of_order_received": 1364,
+    "max_buffer_size": 3514,
+    "windows_emitted": 86399,
+    "current_buffer_size": 0,
+    "current_watermark_ms": 1760054399955.0
   },
   "decision_distribution": {
     "counts": {
-      "ALLOWED": 75351,
-      "RESTRICTED": 24568,
-      "HALTED": 16546
+      "ALLOWED": 74884,
+      "RESTRICTED": 27590,
+      "HALTED": 2034
     },
     "rates": {
-      "ALLOWED": 64.7,
-      "RESTRICTED": 21.09,
-      "HALTED": 14.21
+      "ALLOWED": 71.65,
+      "RESTRICTED": 26.4,
+      "HALTED": 1.95
     }
   },
   "sanitization_distribution": {
-    "ACCEPT": 75550,
-    "REPAIR": 24573,
-    "QUARANTINE": 16342
+    "ACCEPT": 75073,
+    "REPAIR": 27585,
+    "QUARANTINE": 1850
   },
-  "state_transitions_count": 22461,
-  "decisions_logged_count": 41114
+  "state_transitions_count": 21950,
+  "decisions_logged_count": 104508
 }

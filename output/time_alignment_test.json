@@ -1,0 +1,206 @@
+[
+  {
+    "name": "baseline",
+    "params": {
+      "allowed_lateness_ms": 100,
+      "buffer_duration_ms": 50,
+      "window_size_ms": 1000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 76,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "lateness=50",
+    "params": {
+      "allowed_lateness_ms": 50,
+      "buffer_duration_ms": 50,
+      "window_size_ms": 1000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.59,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.14,
+      "out_of_order": 13650,
+      "late_events": 607,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "lateness=200",
+    "params": {
+      "allowed_lateness_ms": 200,
+      "buffer_duration_ms": 50,
+      "window_size_ms": 1000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 39,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "lateness=500",
+    "params": {
+      "allowed_lateness_ms": 500,
+      "buffer_duration_ms": 50,
+      "window_size_ms": 1000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 3,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "buffer=0",
+    "params": {
+      "allowed_lateness_ms": 100,
+      "buffer_duration_ms": 0,
+      "window_size_ms": 1000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 76,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "buffer=100",
+    "params": {
+      "allowed_lateness_ms": 100,
+      "buffer_duration_ms": 100,
+      "window_size_ms": 1000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 76,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "buffer=200",
+    "params": {
+      "allowed_lateness_ms": 100,
+      "buffer_duration_ms": 200,
+      "window_size_ms": 1000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 76,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "window=500",
+    "params": {
+      "allowed_lateness_ms": 100,
+      "buffer_duration_ms": 50,
+      "window_size_ms": 500
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 76,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "window=2000",
+    "params": {
+      "allowed_lateness_ms": 100,
+      "buffer_duration_ms": 50,
+      "window_size_ms": 2000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 76,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "relaxed",
+    "params": {
+      "allowed_lateness_ms": 200,
+      "buffer_duration_ms": 100,
+      "window_size_ms": 1000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 39,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "strict",
+    "params": {
+      "allowed_lateness_ms": 50,
+      "buffer_duration_ms": 0,
+      "window_size_ms": 500
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.59,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.14,
+      "out_of_order": 13650,
+      "late_events": 607,
+      "crossed_quarantine": 0
+    }
+  },
+  {
+    "name": "very_relaxed",
+    "params": {
+      "allowed_lateness_ms": 500,
+      "buffer_duration_ms": 200,
+      "window_size_ms": 2000
+    },
+    "results": {
+      "total_decisions": 12971,
+      "allowed_pct": 83.73,
+      "restricted_pct": 16.27,
+      "halted_pct": 0.0,
+      "out_of_order": 13650,
+      "late_events": 3,
+      "crossed_quarantine": 0
+    }
+  }
+]

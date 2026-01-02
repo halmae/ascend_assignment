@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Decision Engine - 통합 실행 파일 (v3)
+Decision Engine - 통합 실행 파일 (v4 - BufferedProcessor)
 
 ================================================================================
-기능:
-- Progress bar만 콘솔 출력 (깔끔)
-- State transitions, decisions는 실시간 파일 기록
-- Research vs Validation 비교
+v4 변경사항:
+- BufferedProcessor 사용 (Time Alignment Policy 적용)
+- EventBuffer를 통한 out-of-order 이벤트 정렬
+- watermark 기반 처리
 ================================================================================
 
 사용법:
@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.config import THRESHOLDS, print_thresholds, get_thresholds_dict
 from src.data_source import create_data_source
-from src.processor import Processor, ProcessingResult
+from src.buffered_processor import BufferedProcessor, ProcessingResult
 
 
 # =============================================================================
@@ -55,7 +55,7 @@ class ProgressDisplay:
         self.ticker_count = 0
         self.liq_count = 0
     
-    def update(self, event_type: str = None, processor: Processor = None):
+    def update(self, event_type: str = None, processor: BufferedProcessor = None):
         """업데이트"""
         self.current += 1
         
@@ -77,7 +77,7 @@ class ProgressDisplay:
             self._print(processor)
             self.last_print_time = current_time
     
-    def _print(self, processor: Processor = None):
+    def _print(self, processor: BufferedProcessor = None):
         """Progress 출력"""
         elapsed = time.time() - self.start_time
         rate = self.current / elapsed if elapsed > 0 else 0
@@ -118,7 +118,7 @@ class ProgressDisplay:
         
         print(line, end='', flush=True)
     
-    def finish(self, processor: Processor = None):
+    def finish(self, processor: BufferedProcessor = None):
         """완료"""
         elapsed = time.time() - self.start_time
         rate = self.current / elapsed if elapsed > 0 else 0
@@ -167,8 +167,12 @@ def print_header(title: str, data_info: Dict = None):
         for k, v in data_info.items():
             print(f"  {k}: {v}")
     
-    print(f"\n[Thresholds]")
-    print(f"  allowed_lateness_ms:           {THRESHOLDS.allowed_lateness_ms}")
+    print(f"\n[Time Alignment Policy]")
+    print(f"  buffer_max_size:       {THRESHOLDS.buffer_max_size}")
+    print(f"  window_size_ms:        {THRESHOLDS.window_size_ms}")
+    print(f"  allowed_lateness_ms:   {THRESHOLDS.allowed_lateness_ms}")
+    
+    print(f"\n[Volatility Stability]")
     print(f"  volatility_window_size:        {THRESHOLDS.volatility_window_size}")
     print(f"  volatility_min_samples:        {THRESHOLDS.volatility_min_samples}")
     print(f"  volatility_valid_threshold:    {THRESHOLDS.volatility_valid_threshold} bps (p90)")
@@ -195,10 +199,17 @@ def print_summary(result: ProcessingResult, output_dir: str):
         pct = count / total * 100 if total > 0 else 0
         print(f"  {san:12}: {count:>8,} ({pct:>5.1f}%)")
     
+    print(f"\n[Buffer Stats]")
+    buf = result.buffer_stats
+    print(f"  Total Received:    {buf.get('total_received', 0):>10,}")
+    print(f"  Total Emitted:     {buf.get('total_emitted', 0):>10,}")
+    print(f"  Dropped (Late):    {buf.get('dropped_late', 0):>10,}")
+    print(f"  Out-of-Order:      {buf.get('out_of_order_received', 0):>10,}")
+    print(f"  Max Buffer Size:   {buf.get('max_buffer_size', 0):>10,}")
+    
     print(f"\n[Stats]")
     print(f"  Tickers:           {result.stats.get('tickers', 0):>10,}")
     print(f"  Liquidations:      {result.stats.get('liquidations', 0):>10,}")
-    print(f"  Out-of-Order:      {result.stats.get('out_of_order', 0):>10,}")
     print(f"  State Transitions: {result.state_transitions_count:>10,}")
     print(f"  Processing Time:   {result.processing_time_sec:>10.1f}s")
     
@@ -206,7 +217,6 @@ def print_summary(result: ProcessingResult, output_dir: str):
     print(f"  📁 {output_dir}/")
     print(f"     ├── state_transitions.jsonl")
     print(f"     ├── decisions.jsonl")
-    print(f"     ├── liquidations.jsonl")
     print(f"     └── summary.json")
     
     print("=" * 70)
@@ -217,7 +227,7 @@ def print_summary(result: ProcessingResult, output_dir: str):
 # =============================================================================
 
 def run_historical_single(data_dir: str, output_dir: str, name: str) -> ProcessingResult:
-    """단일 Historical 실행"""
+    """단일 Historical 실행 (BufferedProcessor 사용)"""
     total_estimate = estimate_total_events(data_dir)
     
     print_header(f"{name} Validation", {
@@ -226,8 +236,8 @@ def run_historical_single(data_dir: str, output_dir: str, name: str) -> Processi
         'Est. Events': f"~{total_estimate:,}"
     })
     
-    # 프로세서 (output_dir 전달하여 실시간 로깅)
-    processor = Processor(mode=name.lower(), output_dir=output_dir)
+    # BufferedProcessor (output_dir 전달하여 실시간 로깅)
+    processor = BufferedProcessor(mode=name.lower(), output_dir=output_dir)
     
     # 데이터 소스
     source = create_data_source('historical', data_dir=data_dir)
@@ -237,9 +247,13 @@ def run_historical_single(data_dir: str, output_dir: str, name: str) -> Processi
     
     try:
         for event in source.get_events():
-            processor.process_event(event)
+            # BufferedProcessor는 여러 결과를 반환할 수 있음
+            results = processor.process_event(event)
             event_type = event.event_type.value if hasattr(event.event_type, 'value') else str(event.event_type)
             progress.update(event_type, processor)
+        
+        # 버퍼에 남은 이벤트 처리 (중요!)
+        remaining_results = processor.flush()
         
         progress.finish(processor)
         
@@ -450,7 +464,8 @@ def print_comparison(r: ProcessingResult, v: ProcessingResult):
     stats_compare = [
         ('Total Decisions', r_total, v_total),
         ('Liquidations', r.stats.get('liquidations', 0), v.stats.get('liquidations', 0)),
-        ('Out-of-Order', r.stats.get('out_of_order', 0), v.stats.get('out_of_order', 0)),
+        ('Out-of-Order', r.buffer_stats.get('out_of_order_received', 0), v.buffer_stats.get('out_of_order_received', 0)),
+        ('Dropped (Late)', r.buffer_stats.get('dropped_late', 0), v.buffer_stats.get('dropped_late', 0)),
         ('State Transitions', r.state_transitions_count, v.state_transitions_count),
         ('Processing (sec)', r.processing_time_sec, v.processing_time_sec),
     ]
@@ -477,8 +492,8 @@ def print_comparison(r: ProcessingResult, v: ProcessingResult):
     else:
         print(f"  ⚠️ Validation에서 ALLOWED 증가 (Δ={delta_allowed:+.1f}%)")
     
-    v_ooo = v.stats.get('out_of_order', 0)
-    r_ooo = r.stats.get('out_of_order', 0)
+    v_ooo = v.buffer_stats.get('out_of_order_received', 0)
+    r_ooo = r.buffer_stats.get('out_of_order_received', 0)
     if v_ooo > r_ooo * 2 and v_ooo > 100:
         print(f"  ⚠️ Out-of-Order 증가 (R:{r_ooo:,} → V:{v_ooo:,})")
     
@@ -505,8 +520,8 @@ async def run_realtime(symbol: str, duration_sec: int, output_dir: str, source_r
     
     print("  💡 Ctrl+C를 누르면 안전하게 종료됩니다.\n")
     
-    # 프로세서
-    processor = Processor(mode='realtime', output_dir=output_dir)
+    # BufferedProcessor
+    processor = BufferedProcessor(mode='realtime', output_dir=output_dir)
     
     # 데이터 소스
     source = create_data_source('realtime', symbol=symbol, duration_sec=duration_sec)
@@ -517,7 +532,7 @@ async def run_realtime(symbol: str, duration_sec: int, output_dir: str, source_r
     
     try:
         async for event in source.get_events_async():
-            processor.process_event(event)
+            results = processor.process_event(event)
             event_type = event.event_type.value if hasattr(event.event_type, 'value') else str(event.event_type)
             progress.update(event_type, processor)
     
@@ -525,6 +540,9 @@ async def run_realtime(symbol: str, duration_sec: int, output_dir: str, source_r
         print("\n\n  🛑 종료 신호 수신...")
     
     finally:
+        # 버퍼에 남은 이벤트 처리
+        remaining_results = processor.flush()
+        
         progress.finish(processor)
         processor.save_summary()
         processor.close()

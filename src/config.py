@@ -28,9 +28,10 @@ class Thresholds:
     
     구조:
     ├── Time Alignment Policy (과제 6.2)
-    │   ├── allowed_lateness
-    │   ├── buffer
-    │   └── window / watermark
+    │   ├── buffer: N개의 이벤트를 모아서 정렬
+    │   ├── window: 버퍼 내 event-time 범위 제한
+    │   ├── watermark: emit된 마지막 event-time
+    │   └── allowed_lateness: watermark 이전 허용 범위
     │
     ├── Data Trust (데이터 신뢰도)
     │   ├── Freshness: 데이터 신선도
@@ -43,11 +44,26 @@ class Thresholds:
     # =========================================================================
     # TIME ALIGNMENT POLICY (과제 6.2)
     # =========================================================================
+    # 핵심 개념:
+    #   - event-time: 이벤트가 실제 발생한 시간 (서버 timestamp)
+    #   - processing-time: 이벤트가 시스템에 도착한 시간 (local_timestamp)
+    #   - buffer: N개의 이벤트를 모아서 event-time 기준으로 정렬
+    #   - window: 버퍼 내 이벤트의 event-time 범위 제한
+    #   - watermark: emit된 마지막 event-time (이 시점 이전은 처리 완료)
+    #   - allowed_lateness: watermark 이전이지만 허용할 범위
+    #
+    # 동작 방식:
+    #   1. 이벤트가 도착하면 버퍼에 추가 (event-time 기준 heap)
+    #   2. 버퍼가 buffer_max_size에 도달하거나 window 초과 시:
+    #      - 가장 오래된 이벤트들을 정렬하여 emit
+    #      - watermark = emit된 마지막 event-time
+    #   3. event-time < watermark - allowed_lateness인 이벤트는 drop (late)
+    # =========================================================================
     
-    allowed_lateness_ms: float = 100.0
-    buffer_duration_ms: float = 50.0
-    window_size_ms: float = 1000.0
-    watermark_delay_ms: float = 200.0
+    # 버퍼 설정
+    buffer_max_size: int = 1000           # 버퍼에 담을 최대 이벤트 수
+    window_size_ms: float = 100.0         # 버퍼 내 event-time 범위 제한 (ms)
+    allowed_lateness_ms: float = 10.0     # watermark 이전 이벤트 허용 범위 (ms)
     
     # =========================================================================
     # DATA TRUST - Freshness (데이터 신선도)
@@ -61,8 +77,23 @@ class Thresholds:
     # =========================================================================
     # DATA TRUST - Integrity / Sanitization Policy (과제 6.3)
     # =========================================================================
+    # Crossed Market 3단계 처리:
+    #   - < accept_threshold: ACCEPT (시장 노이즈)
+    #   - < quarantine_threshold: REPAIR (주의 필요)
+    #   - >= quarantine_threshold: QUARANTINE (신뢰 불가)
+    #
+    # EDA 결과:
+    #   Research: 5-36 bps, median 23 bps
+    #   Validation: 5-754 bps, median 53 bps, 32%가 100+ bps
+    # =========================================================================
     
-    integrity_repair_threshold_bps: float = 5.0
+    crossed_accept_threshold_bps: float = 10.0     # 미만: ACCEPT
+    crossed_quarantine_threshold_bps: float = 30.0  # 이상: QUARANTINE, 미만: REPAIR
+    
+    # Price outside spread threshold
+    price_outside_repair_bps: float = 5.0
+    price_outside_quarantine_bps: float = 10.0
+    
     imbalance_threshold: float = 0.3
     funding_rate_significant: float = 0.0001
     imbalance_funding_strict: bool = False
@@ -172,14 +203,13 @@ def print_thresholds():
     """현재 임계값 출력"""
     t = THRESHOLDS
     print("=" * 70)
-    print("📋 Current Thresholds (config.py v3 - Price Volatility)")
+    print("📋 Current Thresholds (config.py v4 - 3-Level Crossed Market)")
     print("=" * 70)
     
     print("\n[Time Alignment Policy]")
-    print(f"  allowed_lateness_ms:     {t.allowed_lateness_ms}")
-    print(f"  buffer_duration_ms:      {t.buffer_duration_ms}")
+    print(f"  buffer_max_size:         {t.buffer_max_size}")
     print(f"  window_size_ms:          {t.window_size_ms}")
-    print(f"  watermark_delay_ms:      {t.watermark_delay_ms}")
+    print(f"  allowed_lateness_ms:     {t.allowed_lateness_ms}")
     
     print("\n[Data Trust - Freshness]")
     print(f"  trusted_latency_ms:      {t.freshness_trusted_latency_ms}")
@@ -187,11 +217,14 @@ def print_thresholds():
     print(f"  trusted_stale_ratio:     {t.freshness_trusted_stale_ratio}")
     print(f"  degraded_stale_ratio:    {t.freshness_degraded_stale_ratio}")
     
-    print("\n[Data Trust - Integrity/Sanitization]")
-    print(f"  repair_threshold_bps:    {t.integrity_repair_threshold_bps}")
-    print(f"  imbalance_threshold:     {t.imbalance_threshold}")
-    print(f"  funding_rate_significant:{t.funding_rate_significant}")
-    print(f"  imbalance_funding_strict:{t.imbalance_funding_strict}")
+    print("\n[Data Trust - Integrity/Sanitization (3-Level)]")
+    print(f"  Crossed Market:")
+    print(f"    < {t.crossed_accept_threshold_bps} bps:  ACCEPT (noise)")
+    print(f"    < {t.crossed_quarantine_threshold_bps} bps: REPAIR (caution)")
+    print(f"    >= {t.crossed_quarantine_threshold_bps} bps: QUARANTINE (untrusted)")
+    print(f"  Price Outside Spread:")
+    print(f"    < {t.price_outside_quarantine_bps} bps:  REPAIR")
+    print(f"    >= {t.price_outside_quarantine_bps} bps: QUARANTINE")
     
     print("\n[Hypothesis - Price Volatility Stability]")
     print(f"  volatility_window_size:      {t.volatility_window_size}")
@@ -207,10 +240,9 @@ def get_thresholds_dict() -> dict:
     t = THRESHOLDS
     return {
         'time_alignment': {
-            'allowed_lateness_ms': t.allowed_lateness_ms,
-            'buffer_duration_ms': t.buffer_duration_ms,
+            'buffer_max_size': t.buffer_max_size,
             'window_size_ms': t.window_size_ms,
-            'watermark_delay_ms': t.watermark_delay_ms,
+            'allowed_lateness_ms': t.allowed_lateness_ms,
         },
         'freshness': {
             'trusted_latency_ms': t.freshness_trusted_latency_ms,
@@ -219,7 +251,9 @@ def get_thresholds_dict() -> dict:
             'degraded_stale_ratio': t.freshness_degraded_stale_ratio,
         },
         'integrity': {
-            'repair_threshold_bps': t.integrity_repair_threshold_bps,
+            'crossed_accept_threshold_bps': t.crossed_accept_threshold_bps,
+            'crossed_quarantine_threshold_bps': t.crossed_quarantine_threshold_bps,
+            'price_outside_quarantine_bps': t.price_outside_quarantine_bps,
             'imbalance_threshold': t.imbalance_threshold,
             'funding_rate_significant': t.funding_rate_significant,
         },
