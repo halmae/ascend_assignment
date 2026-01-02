@@ -1,0 +1,57 @@
+{
+  "mode": "realtime",
+  "processing_time_sec": 22502.85,
+  "thresholds": {
+    "time_alignment": {
+      "allowed_lateness_ms": 100.0,
+      "buffer_duration_ms": 50.0,
+      "window_size_ms": 1000.0,
+      "watermark_delay_ms": 200.0
+    },
+    "freshness": {
+      "trusted_latency_ms": 20.0,
+      "degraded_latency_ms": 50.0,
+      "trusted_stale_ratio": 0.05,
+      "degraded_stale_ratio": 0.15
+    },
+    "integrity": {
+      "repair_threshold_bps": 5.0,
+      "imbalance_threshold": 0.3,
+      "funding_rate_significant": 0.0001
+    },
+    "volatility_stability": {
+      "window_size": 75,
+      "min_samples": 20,
+      "valid_threshold": 0.5,
+      "weakening_threshold": 0.62
+    }
+  },
+  "stats": {
+    "trades": 308893,
+    "orderbook_updates": 219307,
+    "tickers": 11152,
+    "liquidations": 123,
+    "snapshots": 0,
+    "out_of_order": 15431,
+    "late_events": 1532
+  },
+  "decision_distribution": {
+    "counts": {
+      "ALLOWED": 3425,
+      "RESTRICTED": 2947,
+      "HALTED": 4780
+    },
+    "rates": {
+      "ALLOWED": 30.71,
+      "RESTRICTED": 26.43,
+      "HALTED": 42.86
+    }
+  },
+  "sanitization_distribution": {
+    "ACCEPT": 11009,
+    "REPAIR": 143,
+    "QUARANTINE": 0
+  },
+  "state_transitions_count": 115,
+  "decisions_logged_count": 7727
+}

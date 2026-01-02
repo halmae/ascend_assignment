@@ -255,7 +255,7 @@ def run_historical_single(data_dir: str, output_dir: str, name: str) -> Processi
 
 
 def run_historical_comparison(research_dir: str, validation_dir: str, output_base: str):
-    """Research vs Validation 비교"""
+    """Research vs Validation 비교 + Historical 통합 출력"""
     print("\n" + "=" * 70)
     print("📊 Historical Validation: Research vs Validation")
     print("=" * 70)
@@ -274,10 +274,145 @@ def run_historical_comparison(research_dir: str, validation_dir: str, output_bas
         validation_dir, f"{output_base}/validation", "Validation"
     )
     
-    # 3. 비교
+    # 3. Historical 통합 (Research + Validation 순차 처리)
+    print("\n" + "=" * 70)
+    print("📦 Historical 통합 출력 생성 중...")
+    print("=" * 70)
+    
+    create_historical_combined(
+        research_dir, validation_dir, 
+        f"{output_base}/historical",
+        research_result, validation_result
+    )
+    
+    # 4. 비교
     print_comparison(research_result, validation_result)
     
     return research_result, validation_result
+
+
+def create_historical_combined(research_dir: str, validation_dir: str, 
+                                output_dir: str,
+                                research_result: ProcessingResult,
+                                validation_result: ProcessingResult):
+    """Historical 통합 출력 생성 (Research + Validation 결과 병합)"""
+    import json
+    from pathlib import Path
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    research_path = Path(output_dir).parent / "research"
+    validation_path = Path(output_dir).parent / "validation"
+    
+    # 1. state_transitions.jsonl 병합
+    with open(output_path / "state_transitions.jsonl", 'w') as out_f:
+        # Research
+        research_trans = research_path / "state_transitions.jsonl"
+        if research_trans.exists():
+            with open(research_trans) as f:
+                for line in f:
+                    data = json.loads(line)
+                    data['source'] = 'research'
+                    out_f.write(json.dumps(data) + '\n')
+        
+        # Validation
+        validation_trans = validation_path / "state_transitions.jsonl"
+        if validation_trans.exists():
+            with open(validation_trans) as f:
+                for line in f:
+                    data = json.loads(line)
+                    data['source'] = 'validation'
+                    out_f.write(json.dumps(data) + '\n')
+    
+    # 2. decisions.jsonl 병합
+    with open(output_path / "decisions.jsonl", 'w') as out_f:
+        research_dec = research_path / "decisions.jsonl"
+        if research_dec.exists():
+            with open(research_dec) as f:
+                for line in f:
+                    data = json.loads(line)
+                    data['source'] = 'research'
+                    out_f.write(json.dumps(data) + '\n')
+        
+        validation_dec = validation_path / "decisions.jsonl"
+        if validation_dec.exists():
+            with open(validation_dec) as f:
+                for line in f:
+                    data = json.loads(line)
+                    data['source'] = 'validation'
+                    out_f.write(json.dumps(data) + '\n')
+    
+    # 3. summary.json 통합
+    r = research_result
+    v = validation_result
+    
+    r_total = r.total_decisions
+    v_total = v.total_decisions
+    combined_total = r_total + v_total
+    
+    combined_summary = {
+        'mode': 'historical',
+        'datasets': ['research', 'validation'],
+        'combined': {
+            'total_decisions': combined_total,
+            'decision_counts': {
+                k: r.decision_counts.get(k, 0) + v.decision_counts.get(k, 0)
+                for k in ['ALLOWED', 'RESTRICTED', 'HALTED']
+            },
+            'decision_rates': {
+                k: round((r.decision_counts.get(k, 0) + v.decision_counts.get(k, 0)) / combined_total * 100, 2)
+                if combined_total > 0 else 0
+                for k in ['ALLOWED', 'RESTRICTED', 'HALTED']
+            },
+            'state_transitions': r.state_transitions_count + v.state_transitions_count,
+            'processing_time_sec': round(r.processing_time_sec + v.processing_time_sec, 2),
+        },
+        'research': {
+            'total_decisions': r_total,
+            'decision_counts': r.decision_counts,
+            'decision_rates': {
+                k: round(cnt / r_total * 100, 2) if r_total > 0 else 0
+                for k, cnt in r.decision_counts.items()
+            },
+            'stats': r.stats,
+            'state_transitions': r.state_transitions_count,
+        },
+        'validation': {
+            'total_decisions': v_total,
+            'decision_counts': v.decision_counts,
+            'decision_rates': {
+                k: round(cnt / v_total * 100, 2) if v_total > 0 else 0
+                for k, cnt in v.decision_counts.items()
+            },
+            'stats': v.stats,
+            'state_transitions': v.state_transitions_count,
+        },
+        'comparison': {
+            'allowed_delta': round(
+                (v.decision_counts.get('ALLOWED', 0) / v_total * 100 if v_total > 0 else 0) -
+                (r.decision_counts.get('ALLOWED', 0) / r_total * 100 if r_total > 0 else 0), 1
+            ),
+            'halted_delta': round(
+                (v.decision_counts.get('HALTED', 0) / v_total * 100 if v_total > 0 else 0) -
+                (r.decision_counts.get('HALTED', 0) / r_total * 100 if r_total > 0 else 0), 1
+            ),
+            'out_of_order_ratio': round(
+                v.stats.get('out_of_order', 0) / r.stats.get('out_of_order', 1), 2
+            ),
+            'liquidation_ratio': round(
+                v.stats.get('liquidations', 0) / max(r.stats.get('liquidations', 1), 1), 2
+            ),
+        },
+        'thresholds': get_thresholds_dict(),
+    }
+    
+    with open(output_path / "summary.json", 'w') as f:
+        json.dump(combined_summary, f, indent=2)
+    
+    print(f"  ✅ {output_dir}/state_transitions.jsonl")
+    print(f"  ✅ {output_dir}/decisions.jsonl")
+    print(f"  ✅ {output_dir}/summary.json")
 
 
 def print_comparison(r: ProcessingResult, v: ProcessingResult):
@@ -431,8 +566,16 @@ Examples:
   
   # 설정 확인
   python run.py --show-config
+  
+  # Docker 실행
+  docker run -v /path/to/data:/data your-image historical
+  docker run your-image realtime
         """
     )
+    
+    # Positional argument for Docker compatibility
+    parser.add_argument('docker_mode', nargs='?', choices=['historical', 'realtime'],
+                        help='Mode for Docker (historical/realtime)')
     
     parser.add_argument('--mode', choices=['historical', 'realtime'])
     parser.add_argument('--research', type=str, help='Research data dir')
@@ -445,6 +588,15 @@ Examples:
     parser.add_argument('--show-config', action='store_true')
     
     args = parser.parse_args()
+    
+    # Docker mode support (positional argument)
+    if args.docker_mode:
+        args.mode = args.docker_mode
+        if args.mode == 'historical' and not args.data and not args.research:
+            # Docker 기본 경로
+            args.data = '/data'
+            args.name = 'Historical'
+            args.output = '/output'
     
     if args.show_config:
         print_thresholds()

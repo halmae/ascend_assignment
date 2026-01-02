@@ -1,0 +1,16 @@
+{
+  "config": {
+    "match_window_ms": 100.0
+  },
+  "total_integrity_events": 1033,
+  "total_liquidations": 3499,
+  "compound_failures": 625,
+  "compound_matched": 8,
+  "spread_only_failures": 0,
+  "spread_only_matched": 0,
+  "price_only_failures": 408,
+  "price_only_matched": 36,
+  "compound_match_rate": 0.0128,
+  "spread_only_match_rate": 0.0,
+  "price_only_match_rate": 0.08823529411764706
+}

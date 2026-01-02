@@ -1,0 +1,99 @@
+{
+  "mode": "historical",
+  "datasets": [
+    "research",
+    "validation"
+  ],
+  "combined": {
+    "total_decisions": 237008,
+    "decision_counts": {
+      "ALLOWED": 122687,
+      "RESTRICTED": 40924,
+      "HALTED": 73397
+    },
+    "decision_rates": {
+      "ALLOWED": 51.76,
+      "RESTRICTED": 17.27,
+      "HALTED": 30.97
+    },
+    "state_transitions": 35467,
+    "processing_time_sec": 1992.73
+  },
+  "research": {
+    "total_decisions": 116465,
+    "decision_counts": {
+      "ALLOWED": 75351,
+      "RESTRICTED": 24568,
+      "HALTED": 16546
+    },
+    "decision_rates": {
+      "ALLOWED": 64.7,
+      "RESTRICTED": 21.09,
+      "HALTED": 14.21
+    },
+    "stats": {
+      "trades": 3938198,
+      "orderbook_updates": 1665505,
+      "tickers": 116466,
+      "liquidations": 1561,
+      "snapshots": 2,
+      "out_of_order": 142661,
+      "late_events": 506
+    },
+    "state_transitions": 22461
+  },
+  "validation": {
+    "total_decisions": 120543,
+    "decision_counts": {
+      "ALLOWED": 47336,
+      "RESTRICTED": 16356,
+      "HALTED": 56851
+    },
+    "decision_rates": {
+      "ALLOWED": 39.27,
+      "RESTRICTED": 13.57,
+      "HALTED": 47.16
+    },
+    "stats": {
+      "trades": 8951352,
+      "orderbook_updates": 1675163,
+      "tickers": 120546,
+      "liquidations": 3499,
+      "snapshots": 6,
+      "out_of_order": 381778,
+      "late_events": 17907
+    },
+    "state_transitions": 13006
+  },
+  "comparison": {
+    "allowed_delta": -25.4,
+    "halted_delta": 33.0,
+    "out_of_order_ratio": 2.68,
+    "liquidation_ratio": 2.24
+  },
+  "thresholds": {
+    "time_alignment": {
+      "allowed_lateness_ms": 100.0,
+      "buffer_duration_ms": 50.0,
+      "window_size_ms": 1000.0,
+      "watermark_delay_ms": 200.0
+    },
+    "freshness": {
+      "trusted_latency_ms": 20.0,
+      "degraded_latency_ms": 50.0,
+      "trusted_stale_ratio": 0.05,
+      "degraded_stale_ratio": 0.15
+    },
+    "integrity": {
+      "repair_threshold_bps": 5.0,
+      "imbalance_threshold": 0.3,
+      "funding_rate_significant": 0.0001
+    },
+    "volatility_stability": {
+      "window_size": 75,
+      "min_samples": 20,
+      "valid_threshold": 0.5,
+      "weakening_threshold": 0.62
+    }
+  }
+}
