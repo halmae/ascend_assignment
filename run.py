@@ -39,15 +39,15 @@ from src.buffered_processor import BufferedProcessor, ProcessingResult
 # =============================================================================
 
 class ProgressDisplay:
-    """깔끔한 Progress 표시"""
+    """Progress 표시 (단순화 버전 - 처리된 이벤트 수만 표시)"""
     
-    def __init__(self, name: str = "Processing", total_estimate: int = 0):
+    def __init__(self, name: str = "Processing", log_interval: int = 100000):
         self.name = name
-        self.total_estimate = total_estimate
+        self.log_interval = log_interval
         self.current = 0
         self.start_time = time.time()
         self.last_print_time = 0
-        self.print_interval = 0.3  # 0.3초마다 업데이트
+        self.print_interval = 2.0  # 2초마다 업데이트
         
         # 이벤트 카운트
         self.ob_count = 0
@@ -71,9 +71,10 @@ class ProgressDisplay:
             elif 'liquidation' in et:
                 self.liq_count += 1
         
-        # 주기적 출력
+        # 주기적 출력 (시간 또는 이벤트 수 기준)
         current_time = time.time()
-        if current_time - self.last_print_time >= self.print_interval:
+        if (current_time - self.last_print_time >= self.print_interval or 
+            self.current % self.log_interval == 0):
             self._print(processor)
             self.last_print_time = current_time
     
@@ -82,27 +83,14 @@ class ProgressDisplay:
         elapsed = time.time() - self.start_time
         rate = self.current / elapsed if elapsed > 0 else 0
         
-        # ETA 계산
-        if self.total_estimate > 0 and rate > 0:
-            remaining = (self.total_estimate - self.current) / rate
-            eta_str = f"ETA:{remaining:>5.0f}s"
-            pct = min(100, self.current / self.total_estimate * 100)
-            bar_len = 25
-            filled = int(bar_len * pct / 100)
-            bar = "█" * filled + "░" * (bar_len - filled)
-            progress_str = f"[{bar}] {pct:>5.1f}%"
-        else:
-            eta_str = ""
-            progress_str = ""
-        
-        # Decision 정보 (processor에서 가져오기)
+        # Decision 정보
         if processor:
             total_dec = sum(processor.decision_counts.values())
             if total_dec > 0:
                 allowed_pct = processor.decision_counts['ALLOWED'] / total_dec * 100
                 halted_pct = processor.decision_counts['HALTED'] / total_dec * 100
                 decision_str = f"A:{allowed_pct:>4.1f}% H:{halted_pct:>4.1f}%"
-                trans_str = f"Trans:{processor.state_transitions_count:>4}"
+                trans_str = f"Trans:{processor.state_transitions_count}"
             else:
                 decision_str = ""
                 trans_str = ""
@@ -110,11 +98,10 @@ class ProgressDisplay:
             decision_str = ""
             trans_str = ""
         
-        # 한 줄로 출력
-        line = (f"\r  {self.name:>10}: {self.current:>10,} | "
-                f"OB:{self.ob_count:>8,} TK:{self.ticker_count:>6,} LQ:{self.liq_count:>3} | "
-                f"{rate:>7,.0f}/s | {elapsed:>5.1f}s {eta_str:>10} | "
-                f"{decision_str:>16} {trans_str:>10} {progress_str}")
+        # 한 줄로 출력 (% 없이, TR 포함)
+        line = (f"\r  {self.name:>10}: {self.current:>10,} events | "
+                f"OB:{self.ob_count:>7,} TK:{self.ticker_count:>6,} TR:{self.trade_count:>8,} LQ:{self.liq_count:>4} | "
+                f"{rate:>6,.0f}/s | {elapsed:>5.1f}s | {decision_str} {trans_str}")
         
         print(line, end='', flush=True)
     
@@ -129,32 +116,24 @@ class ProgressDisplay:
                 allowed_pct = processor.decision_counts['ALLOWED'] / total_dec * 100
                 halted_pct = processor.decision_counts['HALTED'] / total_dec * 100
                 decision_str = f"A:{allowed_pct:.1f}% H:{halted_pct:.1f}%"
+                trans_str = f"Trans:{processor.state_transitions_count}"
             else:
                 decision_str = ""
+                trans_str = ""
         else:
             decision_str = ""
+            trans_str = ""
         
-        print(f"\r  {self.name:>10}: {self.current:>10,} | ✅ 완료 | "
-              f"{rate:,.0f}/s | {elapsed:.1f}s | {decision_str}" + " " * 40)
+        # 완료 메시지
+        line = (f"\r  {self.name:>10}: {self.current:>10,} events | "
+                f"OB:{self.ob_count:>7,} TK:{self.ticker_count:>6,} TR:{self.trade_count:>8,} LQ:{self.liq_count:>4} | "
+                f"{rate:>6,.0f}/s | {elapsed:>5.1f}s | {decision_str} {trans_str} ✅ DONE")
+        print(line + " " * 20)
 
 
 # =============================================================================
 # Utilities
 # =============================================================================
-
-def estimate_total_events(data_dir: str) -> int:
-    """이벤트 수 추정"""
-    data_path = Path(data_dir)
-    total_size = 0
-    
-    for name in ['orderbook', 'trades', 'ticker', 'liquidations']:
-        for ext in ['.csv', '.csv.gz']:
-            path = data_path / f"{name}{ext}"
-            if path.exists():
-                total_size += path.stat().st_size
-    
-    # ~100 bytes per event
-    return max(int(total_size / 100), 100000)
 
 
 def print_header(title: str, data_info: Dict = None):
@@ -228,12 +207,10 @@ def print_summary(result: ProcessingResult, output_dir: str):
 
 def run_historical_single(data_dir: str, output_dir: str, name: str) -> ProcessingResult:
     """단일 Historical 실행 (BufferedProcessor 사용)"""
-    total_estimate = estimate_total_events(data_dir)
     
     print_header(f"{name} Validation", {
         'Data': data_dir,
         'Output': output_dir,
-        'Est. Events': f"~{total_estimate:,}"
     })
     
     # BufferedProcessor (output_dir 전달하여 실시간 로깅)
@@ -242,8 +219,8 @@ def run_historical_single(data_dir: str, output_dir: str, name: str) -> Processi
     # 데이터 소스
     source = create_data_source('historical', data_dir=data_dir)
     
-    # Progress
-    progress = ProgressDisplay(name=name[:10], total_estimate=total_estimate)
+    # Progress (단순화 - % 없이)
+    progress = ProgressDisplay(name=name[:10], log_interval=100000)
     
     try:
         for event in source.get_events():
